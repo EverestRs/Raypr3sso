@@ -1,4 +1,5 @@
 #include "gpu_scene.h"
+#include "scene_progress.h"
 
 #include <algorithm>
 #include <cctype>
@@ -51,19 +52,26 @@ std::unique_ptr<GPUScene> GPUScene::load(const Model& model) {
 		return 1.0f;
 	}();
 	fprintf(stderr, "  load-stage: packGeometry\n");
+	sceneProgress::report("geometry", 0, 1);
 	GeometryData geometry = packGeometry(model);
+	sceneProgress::report("geometry", 1, 1);
 	fprintf(stderr, "  load-stage: collectTextures\n");
 	TextureData textures = collectTextures(model);
 	fprintf(stderr, "  load-stage: createMaterialData\n");
+	sceneProgress::report("materials", 0, 1);
 	MaterialData materials = createMaterialData(model, textures, emissionScale);
 	fprintf(stderr, "  load-stage: applyMaterialTuning\n");
 	applyMaterialTuning(model, materials);
 	materials.shadowOpaque = classifyOpaqueMaterials(materials, textures);
 	fprintf(stderr, "  load-stage: collectLights\n");
 	LightData lights = collectLights(model, materials, emissionScale);
+	sceneProgress::report("materials", 1, 1);
 	fprintf(stderr, "  load-stage: uploadTextures\n");
+	sceneProgress::report("upload", 0, 1);
 	TextureUploadData textureUpload = uploadTextures(textures);
 	SkyData sky = uploadSky(model);
+	sceneProgress::report("upload", 1, 1);
+	sceneProgress::report("sky", 1, 1);
 
 	GPUMaterialBuffer gpuMaterials{};
 	gpuMaterials.baseColorFactors = materials.baseColorFactors.data();

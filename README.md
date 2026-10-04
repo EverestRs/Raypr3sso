@@ -228,15 +228,18 @@ xdg-open "http://127.0.0.1:8080/threejs/index.html?remote=http://127.0.0.1:9151&
 过渡带）时显示曝光从 2.5 平滑升到 6.0（display-only，不重置累积），出门自动回落——
 `bistro` preset 携带该档参数，服务端经 session JSON 下发，客户端按相机位置逐帧混合。
 **右上控制栈**：保存当前帧（无损 PNG）/ 回到标定机位（R）/ 实时统计面板（分辨率·有效
-spp·chunk 间隔·曝光）/ 全屏（F）/ 质量·曝光面板（精修分辨率四档即时切换 + 曝光滑条
-自动/手动）；键盘 1-4 切画质、H 隐藏 UI；断线显示错误卡片（引用 `./demo.sh`）。
+spp·chunk 间隔·曝光·**收敛 ETA**）/ **首帧-当前帧 A/B 对比**（可拖分割线，看降噪+收敛
+前后差异）/ 全屏（F）/ 质量·曝光面板（精修分辨率四档即时切换 + 曝光滑条自动/手动）；
+键盘 1-4 切画质、H 隐藏 UI；断线显示错误卡片（引用 `./demo.sh`）。场景加载（~60s）
+有**真实分段进度**：引擎经 sceneProgress 钩子上报 parse/decode/geometry/materials/
+upload/sky 阶段，服务端限流广播 `scene-progress` 事件，前端按阶段权重映射进度条。
 所有设置同步进 URL（model/idleRes/exposure），画面可直接分享。相机参数可经 URL 覆盖：
 `&targetDist=12`（轨道目标距离，默认 4m 房间尺度）。场景注册表（`render_server.cpp`
 kModels）：`sphere-test` / `bistro-interior`（纯内景）/ `bistro`（内外合一 + kloppenheim
 白天 HDRI），设置面板内可切换。端到端验证脚本：`scripts/test_midmove_ab.py`（渲染中
 拖相机 A/B）、`scripts/e2e_bistro_combined.py`（内→外切换 + 自动提亮断言）、
-`scripts/e2e_p0_ui.py` / `scripts/e2e_p1_ui.py`（控制项交互验收；依赖同目录
-`e2e_cdp_helper.py`）。
+`scripts/e2e_p0_ui.py` / `scripts/e2e_p1_ui.py` / `scripts/e2e_p2_ui.py`
+（控制项交互验收；依赖同目录 `e2e_cdp_helper.py`）。
 
 ### 第三步：渲染
 

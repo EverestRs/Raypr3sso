@@ -245,6 +245,15 @@
     // P1 统计面板数据源：有效 spp / chunk 间隔（预览事件到达间隔中位数）
     let lastSample = 0, lastBudget = 0, lastPrevT = 0;
     const cadence = [];
+    // P2-11 加载进度：阶段权重（合并场景 parse/decode 各两轮 → 进度单调不降）
+    const LOAD_STAGES = { parse: [0, .2], decode: [.2, .6], geometry: [.6, .72],
+                          materials: [.72, .78], upload: [.78, .97], sky: [.97, 1] };
+    let loadFrac = 0;
+    // P2-12 ETA：样本历史（相邻预览的样本增量 ≈ 当前 chunk 大小）
+    const sampleHist = [];
+    // P2-13 A/B 对比：当前链首帧 + 对比模式状态
+    let chainFirstUrl = null, chainFirstSample = 0;
+    let abOn = false, abPct = 50;
     // 相机提交状态机
     let dragTimer = null;
     let idleTimer = null;
@@ -315,6 +324,16 @@
         color:#e2e8f0; font:13px system-ui,sans-serif; }
       .re-err .card button:hover { background:rgba(96,165,250,.35); }
       .re-hideui .re-chip, .re-hideui .re-ctl, .re-hideui .re-panel { display:none; }
+      .re-ab { position:fixed; inset:0; width:100%; height:100%; object-fit:contain;
+        pointer-events:none; z-index:10; }
+      .re-ab-div { position:fixed; top:0; bottom:0; width:2px; background:#60a5fa;
+        z-index:11; cursor:ew-resize; }
+      .re-ab-div::after { content:''; position:absolute; top:50%; left:-8px;
+        width:18px; height:18px; margin-top:-9px; border-radius:50%;
+        background:#60a5fa; box-shadow:0 0 6px rgba(0,0,0,.6); }
+      .re-ab-tag { position:fixed; top:60px; z-index:11; padding:4px 8px;
+        font:11px monospace; background:rgba(5,7,12,.72); color:#e2e8f0;
+        border-radius:4px; pointer-events:none; }
       @media (pointer: coarse) {
         .re-chip { font-size:13px; }
         .re-title { padding:10px 14px; }
@@ -500,13 +519,23 @@
       + '<div class="re-row"><span>预览分辨率</span><b id="re-stat-res" style="margin-left:auto;font-weight:600"></b></div>'
       + '<div class="re-row"><span>采样</span><b id="re-stat-spp" style="margin-left:auto;font-weight:600"></b></div>'
       + '<div class="re-row"><span>chunk 间隔</span><b id="re-stat-cad" style="margin-left:auto;font-weight:600"></b></div>'
-      + '<div class="re-row"><span>曝光</span><b id="re-stat-exp" style="margin-left:auto;font-weight:600"></b></div>';
+      + '<div class="re-row"><span>曝光</span><b id="re-stat-exp" style="margin-left:auto;font-weight:600"></b></div>'
+      + '<div class="re-row"><span>预计剩余</span><b id="re-stat-eta" style="margin-left:auto;font-weight:600"></b></div>';
     document.body.appendChild(statsPanel);
     const stat = (id, v) => { const el = document.getElementById(id); if (el && v != null) el.textContent = v; };
     function median(arr) {
       if (!arr.length) return null;
       const s = [...arr].sort((a, b) => a - b);
       return s[s.length >> 1];
+    }
+    // P2-12：剩余 chunk 数 × 间隔中位数（几何计划下用最近一次样本增量估 chunk）
+    function etaSeconds() {
+      if (lastBudget <= 0 || lastSample >= lastBudget) return 0;
+      if (cadence.length < 2 || sampleHist.length < 2) return null;
+      const n = sampleHist.length;
+      const chunk = Math.max(1, sampleHist[n - 1] - sampleHist[n - 2]);
+      const remainingChunks = Math.max(1, (lastBudget - lastSample) / chunk);
+      return remainingChunks * median(cadence) / 1000;
     }
     function updateStats() {
       if (statsPanel.hidden) return;
@@ -517,6 +546,8 @@
       stat('re-stat-cad', m != null ? `${Math.round(m)} ms` : '—');
       const e = tierExposure(camera.position);
       stat('re-stat-exp', e > 0 ? e.toFixed(1) : (autoOn ? '自动' : '—'));
+      const eta = etaSeconds();
+      stat('re-stat-eta', eta == null ? '—' : (eta <= 0 ? '完成' : `~${Math.max(1, Math.round(eta))} s`));
     }
     mkBtn('stats', '<svg viewBox="0 0 24 24"><line x1="5" y1="20" x2="5" y2="12"/><line x1="12" y1="20" x2="12" y2="6"/><line x1="19" y1="20" x2="19" y2="10"/></svg>',
           '实时统计', () => {
@@ -524,6 +555,54 @@
             panel.hidden = true;
             if (!statsPanel.hidden) updateStats();
           });
+
+    // ---- P2-13 首帧/当前帧 A/B 对比 ----
+    const abImg = document.createElement('img');
+    abImg.className = 're-ab'; abImg.alt = ''; abImg.hidden = true;
+    document.body.appendChild(abImg);
+    const abDiv = document.createElement('div');
+    abDiv.className = 're-ab-div'; abDiv.hidden = true;
+    document.body.appendChild(abDiv);
+    const abTagA = document.createElement('div');
+    abTagA.className = 're-ab-tag'; abTagA.style.left = '12px'; abTagA.hidden = true;
+    const abTagB = document.createElement('div');
+    abTagB.className = 're-ab-tag'; abTagB.style.right = '64px'; abTagB.hidden = true;
+    document.body.appendChild(abTagA); document.body.appendChild(abTagB);
+    function abApply() {
+      overlay.style.clipPath = `inset(0 0 0 ${abPct}%)`;
+      abDiv.style.left = `calc(${abPct}% - 1px)`;
+    }
+    function abShow() {
+      if (!chainFirstUrl) return;
+      abOn = true;
+      abImg.src = chainFirstUrl;
+      abImg.hidden = false; abDiv.hidden = false;
+      abTagA.hidden = false; abTagB.hidden = false;
+      abTagA.textContent = '首帧 ' + chainFirstSample + ' spp';
+      abTagB.textContent = '当前 ' + lastSample + ' spp';
+      abPct = 50; abApply();
+    }
+    function abHide() {
+      abOn = false;
+      overlay.style.clipPath = '';
+      abImg.hidden = true; abDiv.hidden = true;
+      abTagA.hidden = true; abTagB.hidden = true;
+    }
+    abDiv.addEventListener('pointerdown', (ev) => {
+      ev.preventDefault();
+      const move = (e) => {
+        abPct = Math.min(98, Math.max(2, e.clientX / innerWidth * 100));
+        abApply();
+      };
+      const up = () => {
+        removeEventListener('pointermove', move);
+        removeEventListener('pointerup', up);
+      };
+      addEventListener('pointermove', move);
+      addEventListener('pointerup', up);
+    });
+    mkBtn('compare', '<svg viewBox="0 0 24 24"><rect x="4" y="5" width="16" height="14" rx="1"/><line x1="12" y1="5" x2="12" y2="19"/></svg>',
+          '首帧/当前对比', () => { abOn ? abHide() : abShow(); });
 
     // ---- P1-7 场景切换器（设置面板内一行）----
     const SCENES = [
@@ -644,7 +723,8 @@
     // session 当前相机）。
     // 现场排障计数器（控制台可直接读 window.__remoteDebug）
     const dbg = window.__remoteDebug = { dragFired: 0, idleFired: 0, submits: 0,
-                                         skippedInFlight: 0, idleRetried: 0 };
+                                         skippedInFlight: 0, idleRetried: 0,
+                                         sceneStages: [] };
     let interacting = false;
 
     let lastSubmitOk = false;
@@ -669,7 +749,11 @@
         .then((result) => {
           lastSubmitOk = true;
           if (result.generation) generation = result.generation;
-          if (result.renderId) submittedRenderId = result.renderId;
+          if (result.renderId && result.renderId !== submittedRenderId) {
+            submittedRenderId = result.renderId;
+            chainFirstUrl = null;      // 新链：A/B 首帧基准重取
+            if (abOn) abHide();
+          }
         })
         .catch(() => { dirty = true; lastSubmitOk = false; })
         .finally(() => {
@@ -769,6 +853,19 @@
           .catch(() => { setBar(0); show(model + ' ready'); scheduleDrag(); scheduleIdle(); });
         return;
       }
+      if (msg.type === 'scene-progress') {
+        // P2-11：真实加载进度（阶段权重映射，单调不降——合并场景
+        // parse/decode 各跑两轮）
+        const w = LOAD_STAGES[msg.stage] || [0, 1];
+        const inner = msg.total > 0 ? Math.min(1, msg.done / msg.total) : 1;
+        loadFrac = Math.max(loadFrac, w[0] + (w[1] - w[0]) * inner);
+        if (dbg.sceneStages.indexOf(msg.stage) < 0) dbg.sceneStages.push(msg.stage);
+        setBar(loadFrac);
+        show(model + ' 加载中 · ' + msg.stage +
+             (msg.total > 0 ? ' ' + msg.done + '/' + msg.total :
+              (msg.done > 0 ? ' ' + msg.done : '')));
+        return;
+      }
       if (msg.type === 'progress' || msg.type === 'preview-ready') {
         // 旧帧丢弃：只显示当前提交链、当前 generation、更大 sequence 的帧
         if (msg.renderId !== submittedRenderId) return;
@@ -780,6 +877,8 @@
         if (lastPrevT) { cadence.push(nowT - lastPrevT); if (cadence.length > 8) cadence.shift(); }
         lastPrevT = nowT;
         lastSample = msg.sample; lastBudget = msg.sampleBudget;
+        sampleHist.push(msg.sample); if (sampleHist.length > 8) sampleHist.shift();
+        if (!chainFirstUrl) { chainFirstUrl = new URL(authPath(msg.previewUrl), base).toString(); chainFirstSample = msg.sample; }
         // 批1：预解码后再上屏（img.decode）——高频 JPEG 换帧不再出现
         // 半解码闪烁；晚到的旧解码被 sequence 检查丢弃。
         const url = new URL(authPath(msg.previewUrl), base).toString();
@@ -792,8 +891,11 @@
           shownRenderId = rid;
           shownSequence = seq;
           setBar(msg.sampleBudget > 0 ? msg.sample / msg.sampleBudget : null);
-          show(model + ' spp ' + msg.sample + '/' + msg.sampleBudget);
+          const eta = etaSeconds();
+          show(model + ' spp ' + msg.sample + '/' + msg.sampleBudget +
+               (eta > 0 ? ' · ~' + Math.max(1, Math.round(eta)) + 's' : ''));
           updateStats();
+          if (abOn) abTagB.textContent = '当前 ' + msg.sample + ' spp';
         };
         probe.onerror = () => {};
         probe.src = url;
@@ -850,6 +952,11 @@
       shownSequence = 0;
       submittedRenderId = null;
       serverReady = false;
+      loadFrac = 0;
+      sampleHist.length = 0;
+      cadence.length = 0;
+      chainFirstUrl = null;
+      abHide();
       setBar(null);
       errCard.hidden = true;
       postJson('/api/sessions', { model: model })

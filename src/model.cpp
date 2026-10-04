@@ -1,4 +1,5 @@
 #include "model.h"
+#include "scene_progress.h"
 #include <iostream>
 #include <sstream>
 #include <unordered_map>
@@ -456,6 +457,7 @@ bool Model::importFbx(const std::string& model_folder,
     const std::string path = model_folder + "/" + model_name;
 
     auto tStart = std::chrono::steady_clock::now();
+    sceneProgress::report("parse", 0, 1);
     Assimp::Importer importer;
     const aiScene* scene = importer.ReadFile(path,
         aiProcess_Triangulate |
@@ -469,6 +471,7 @@ bool Model::importFbx(const std::string& model_folder,
     }
     fprintf(stderr, "TIMER assimp-parse: %.1fs\n",
             std::chrono::duration<float>(std::chrono::steady_clock::now() - tStart).count()); fflush(stderr);
+    sceneProgress::report("parse", 1, 1);
 
     // ---- Helper: URL decode for FBX texture paths ----
     auto urlDecode = [](const std::string& src) -> std::string {
@@ -519,8 +522,11 @@ bool Model::importFbx(const std::string& model_folder,
         texTotal += std::chrono::duration<float>(
             std::chrono::steady_clock::now() - t0).count();
         texCnt++;
-        if (texCnt % 40 == 0)
+        if (texCnt % 40 == 0) {
             fprintf(stderr, "TIMER texture-load: %.1fs (n=%d)\n", texTotal, texCnt);
+            // 纹理总数在 FBX 材质遍历中才发现，total=0 表示阶段内计数
+            sceneProgress::report("decode", texCnt, 0);
+        }
         if (ok) {
             return &m_textures.back();
         }

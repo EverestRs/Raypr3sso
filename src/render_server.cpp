@@ -1,4 +1,5 @@
 #include "render_server.h"
+#include "scene_progress.h"
 #include "render_gpu.h"
 #include "scene_presets.h"
 #include "image.h"
@@ -280,6 +281,7 @@ RenderServer::RenderServer(std::string bindAddress, uint16_t port, std::string t
     : bindAddress_(std::move(bindAddress)), port_(port), token_(std::move(token)) {
     if (const char* ttl = std::getenv("RENDER_SESSION_TTL"))
         sessionTtlSeconds_ = std::max(5.0, std::strtod(ttl, nullptr));
+    s_self = this;   // singleton in practice; the progress sink publishes through it
 }
 
 RenderServer::~RenderServer() {
@@ -535,11 +537,36 @@ void RenderServer::gcLoop() {
     }
 }
 
+// ---- scene-load progress sink (P2-11) ----
+RenderServer* RenderServer::s_self = nullptr;
+std::string RenderServer::s_loadingModelId;
+std::string RenderServer::s_lastStage;
+std::chrono::steady_clock::time_point RenderServer::s_lastEmit{};
+
+void RenderServer::sceneProgressSink(const char* stage, int done, int total) {
+    if (!s_self || s_loadingModelId.empty()) return;
+    const auto now = std::chrono::steady_clock::now();
+    const std::string st(stage);
+    const bool boundary = done == 0 || done == total || st != s_lastStage;
+    if (!boundary && now - s_lastEmit < std::chrono::milliseconds(400)) return;
+    s_lastStage = st;
+    s_lastEmit = now;
+    std::ostringstream e;
+    e << "{\"type\":\"scene-progress\",\"model\":\"" << jsonEscape(s_loadingModelId)
+      << "\",\"stage\":\"" << st << "\",\"done\":" << done
+      << ",\"total\":" << total << "}";
+    s_self->publishEventToModel(s_loadingModelId, e.str());
+}
+
 void RenderServer::loadSceneEntry(const std::string& modelId) {
     const ModelSpec* spec = findModelSpec(modelId);
     std::shared_ptr<Model> model;
     std::shared_ptr<GPUScene> scene;
     std::string error;
+    s_loadingModelId = modelId;
+    s_lastStage.clear();
+    s_lastEmit = {};
+    sceneProgress::set(&sceneProgressSink);
     try {
         if (spec->sphere) {
             model = std::make_shared<Model>(Model::createSphereTestScene("diffuse"));
@@ -561,6 +588,8 @@ void RenderServer::loadSceneEntry(const std::string& modelId) {
     } catch (...) {
         error = "scene_load_failed";
     }
+    sceneProgress::set(nullptr);
+    s_loadingModelId.clear();
     std::lock_guard<std::mutex> lock(mutex_);
     auto it = scenes_.find(modelId);
     if (it == scenes_.end()) return;

@@ -238,6 +238,17 @@ private:
     void gcLoop();
     double renderTimeoutSeconds() const;
 
+    // ---- scene-load progress sink (P2-11) ----
+    // The engine (Model ctor / GPUScene::load) reports coarse stages through
+    // sceneProgress while loadSceneEntry runs on the GPU worker with NO lock
+    // held — so the sink may take mutex_ via publishEventToModel. Throttled
+    // to stage changes, stage boundaries, or one event per 400ms.
+    static void sceneProgressSink(const char* stage, int done, int total);
+    static RenderServer* s_self;
+    static std::string s_loadingModelId;
+    static std::string s_lastStage;
+    static std::chrono::steady_clock::time_point s_lastEmit;
+
     std::string bindAddress_;
     uint16_t port_;
     std::string token_;
