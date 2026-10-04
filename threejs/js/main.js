@@ -208,8 +208,13 @@
     // 室外档(base)与室内档之间做 smoothstep 混合（display-only，不重置
     // 累积）。&exposure= 手动覆盖时禁用自动档。
     let autoExposure = null;
+    // 运行时手动/自动（P0 曝光滑条）：autoOn=false 时用滑条值；URL &exposure=
+    // 视为初始手动值并关闭自动档
+    let manualExp = exposure > 0 ? exposure : 0;
+    let autoOn = !(exposure > 0);
     function tierExposure(pos) {
-      if (exposure > 0) return exposure;                 // 手动覆盖优先
+      if (!autoOn && manualExp > 0) return manualExp;    // 运行时手动（滑条）
+      if (exposure > 0) return exposure;                 // URL 手动覆盖
       if (!autoExposure) return 0;                       // 同步前不发送
       if (!autoExposure.indoor) return 0;                // 无室内档：用 session 默认
       const p = [pos.x, pos.y, pos.z];                   // Vector3 没有下标访问
@@ -264,7 +269,33 @@
         border-radius:2px; transition:width .3s; }
       .re-bar.indet i { width:35% !important; animation:re-slide 1.1s ease-in-out infinite; }
       @keyframes re-slide { 0%{margin-left:-35%} 100%{margin-left:100%} }
-      .re-bar.done { opacity:0; transition:opacity .8s; }`;
+      .re-bar.done { opacity:0; transition:opacity .8s; }
+      .re-ctl { position:fixed; top:12px; right:12px; z-index:11; display:flex;
+        flex-direction:column; gap:6px; }
+      .re-btn { width:34px; height:34px; border-radius:6px; background:rgba(5,7,12,.72);
+        border:1px solid rgba(148,163,184,.25); color:#e2e8f0; cursor:pointer;
+        display:flex; align-items:center; justify-content:center; padding:0; }
+      .re-btn:hover { background:rgba(15,23,42,.88); border-color:rgba(148,163,184,.55); }
+      .re-btn svg { width:17px; height:17px; stroke:#e2e8f0; fill:none;
+        stroke-width:1.8; stroke-linecap:round; stroke-linejoin:round; }
+      .re-panel { position:fixed; top:52px; right:12px; z-index:11; width:228px;
+        padding:10px 12px 12px; border-radius:6px; background:rgba(5,7,12,.85);
+        border:1px solid rgba(148,163,184,.25); color:#e2e8f0;
+        font:12px system-ui,sans-serif; }
+      .re-panel h4 { margin:2px 0 7px; font-size:11px; color:#94a3b8;
+        font-weight:600; letter-spacing:.05em; text-transform:uppercase; }
+      .re-q { display:flex; gap:4px; flex-wrap:wrap; }
+      .re-q button { flex:1 1 44%; padding:5px 4px; font:11px system-ui,sans-serif;
+        color:#cbd5e1; background:rgba(148,163,184,.12); border:1px solid transparent;
+        border-radius:4px; cursor:pointer; }
+      .re-q button.on { background:rgba(96,165,250,.25); color:#fff;
+        border-color:rgba(96,165,250,.55); }
+      .re-row { display:flex; align-items:center; gap:8px; margin-top:11px; }
+      .re-row input[type=range] { flex:1; accent-color:#60a5fa; min-width:0; }
+      .re-row .re-ev { min-width:28px; text-align:right; font-family:monospace; }
+      .re-row label { display:flex; gap:4px; align-items:center; color:#cbd5e1;
+        cursor:pointer; white-space:nowrap; }
+      .re-row input[type=checkbox] { accent-color:#60a5fa; }`;
     document.head.appendChild(style);
 
     const title = document.createElement('div');
@@ -296,6 +327,149 @@
       // 依据状态文本切换加载/收敛条形态（保持 'remote: ' 前缀供 E2E 探针）
       if (/loading|connecting|unavailable/.test(text)) setBar(null);
     }
+
+    // ---- 控制面板（P0：保存帧 / 回位 / 质量档 / 曝光 / 全屏）----
+    const SVG = {
+      settings: '<svg viewBox="0 0 24 24"><line x1="4" y1="6" x2="20" y2="6"/><circle cx="14" cy="6" r="2.2"/><line x1="4" y1="12" x2="20" y2="12"/><circle cx="8" cy="12" r="2.2"/><line x1="4" y1="18" x2="20" y2="18"/><circle cx="16" cy="18" r="2.2"/></svg>',
+      save: '<svg viewBox="0 0 24 24"><path d="M12 4v10m0 0l-4-4m4 4l4-4M5 19h14"/></svg>',
+      home: '<svg viewBox="0 0 24 24"><path d="M4 11l8-7 8 7M6 10v9h12v-9"/></svg>',
+      full: '<svg viewBox="0 0 24 24"><path d="M4 9V4h5M15 4h5v5M20 15v5h-5M9 20H4v-5"/></svg>'
+    };
+    const ctl = document.createElement('div');
+    ctl.className = 're-ctl';
+    const mkBtn = (id, icon, title, fn) => {
+      const b = document.createElement('button');
+      b.id = 're-btn-' + id;
+      b.className = 're-btn'; b.title = title; b.innerHTML = icon;
+      b.addEventListener('click', fn);
+      ctl.appendChild(b);
+      return b;
+    };
+    const panel = document.createElement('div');
+    panel.className = 're-panel';
+    panel.hidden = true;
+
+    let saving = false;
+    function saveFrame() {
+      // 无损 PNG（服务端 /image = 精修终帧）；页面与服务器跨端口，用
+      // fetch+blob 下载（a[download] 对跨源 URL 会被浏览器忽略）。
+      if (!submittedRenderId || saving) return;
+      saving = true;
+      fetch(endpoint(authPath(`/api/renders/${submittedRenderId}/image`)))
+        .then(r => { if (!r.ok) throw new Error(r.status); return r.blob(); })
+        .then(b => {
+          const a = document.createElement('a');
+          a.href = URL.createObjectURL(b);
+          a.download = `renderengine_${submittedRenderId}.png`;
+          document.body.appendChild(a); a.click(); a.remove();
+          setTimeout(() => URL.revokeObjectURL(a.href), 5000);
+        })
+        .catch(() => show('保存失败'))
+        .finally(() => { saving = false; });
+    }
+
+    let presetCam = null;   // session-ready 时的标定机位（服务端 preset）
+    function applySessionCamera(info) {
+      const c = info.camera;
+      const pos = new THREE.Vector3(c.position[0], c.position[1], c.position[2]);
+      const dir = new THREE.Vector3(c.direction[0], c.direction[1], c.direction[2]).normalize();
+      const maxSyncDist = Math.max(1, parseFloat(params.get('targetDist')) || 4);
+      const dist = Math.min(
+        Math.max(1, camera.position.distanceTo(controls.target)), maxSyncDist);
+      camera.position.copy(pos);
+      controls.target.copy(pos.clone().add(dir.multiplyScalar(dist)));
+      camera.fov = c.fov;
+      camera.updateProjectionMatrix();
+      controls.update();
+      presetCam = c;
+    }
+    function goHome() {
+      if (!presetCam) return;
+      applySessionCamera({ camera: presetCam });
+      setBar(0);
+      show(model + ' ready');
+      scheduleDrag();
+      scheduleIdle();
+    }
+    function toggleFullscreen() {
+      document.fullscreenElement
+        ? document.exitFullscreen()
+        : document.documentElement.requestFullscreen();
+    }
+
+    // 质量档：改 IDLE 分辨率并立即触发一次精修（服务端在分辨率变化时
+    // 自动重置累积，无需刷新页面）。
+    const QUALITIES = [
+      { name: '流畅', w: 640, h: 360 },
+      { name: '标准', w: 960, h: 540 },
+      { name: '高清', w: 1280, h: 720 },
+      { name: '超清', w: 1920, h: 1080 }
+    ];
+    let qualityIdx = QUALITIES.findIndex(
+      q => q.w === IDLE.width && q.h === IDLE.height);
+    if (qualityIdx < 0) qualityIdx = 1;
+    function setQuality(i) {
+      qualityIdx = i;
+      IDLE.width = QUALITIES[i].w;
+      IDLE.height = QUALITIES[i].h;
+      params.set('idleRes', `${QUALITIES[i].w}x${QUALITIES[i].h}`);
+      history.replaceState(null, '', `${location.pathname}?${params}`);
+      panel.querySelectorAll('.re-q button')
+        .forEach((b, j) => b.classList.toggle('on', j === i));
+      if (serverReady) submitRender(IDLE);
+    }
+
+    mkBtn('settings', SVG.settings, '质量 / 曝光', () => { panel.hidden = !panel.hidden; });
+    mkBtn('save', SVG.save, '保存当前帧 (PNG)', saveFrame);
+    mkBtn('home', SVG.home, '回到标定机位 (R)', goHome);
+    mkBtn('full', SVG.full, '全屏 (F)', toggleFullscreen);
+    document.body.appendChild(ctl);
+
+    // 设置面板内容
+    panel.innerHTML = '<h4>精修分辨率</h4><div class="re-q"></div>'
+      + `<div class="re-row"><span>曝光</span>`
+      + `<input type="range" min="0.5" max="8" step="0.1" value="${(exposure > 0 ? exposure : 2.5).toFixed(1)}">`
+      + `<span class="re-ev">${(exposure > 0 ? exposure : 2.5).toFixed(1)}</span>`
+      + `<label title="室内自动提亮档按相机位置混合；手动时用滑条值"><input type="checkbox" ${exposure > 0 ? '' : 'checked'}>自动</label></div>`;
+    document.body.appendChild(panel);
+    const qRow = panel.querySelector('.re-q');
+    QUALITIES.forEach((q, j) => {
+      const b = document.createElement('button');
+      b.textContent = q.name;
+      b.classList.toggle('on', j === qualityIdx);
+      b.addEventListener('click', () => setQuality(j));
+      qRow.appendChild(b);
+    });
+    const expSlider = panel.querySelector('input[type=range]');
+    const expLabel = panel.querySelector('.re-ev');
+    const expAuto = panel.querySelector('input[type=checkbox]');
+    let expTimer = null;
+    expSlider.addEventListener('input', () => {
+      autoOn = false;                       // 拖滑条 = 切手动
+      manualExp = parseFloat(expSlider.value);
+      expLabel.textContent = manualExp.toFixed(1);
+      expAuto.checked = false;
+      // 防抖：拖动过程 input 高频触发，停手 250ms 后才提交一次精修
+      if (expTimer) clearTimeout(expTimer);
+      expTimer = setTimeout(() => { if (serverReady) submitRender(IDLE); }, 250);
+    });
+    expAuto.addEventListener('change', () => {
+      autoOn = expAuto.checked;
+      if (!autoOn) {
+        manualExp = parseFloat(expSlider.value);
+        if (serverReady) submitRender(IDLE);
+      } else if (serverReady) {
+        submitRender(IDLE);                 // 回到自动档（室内提亮恢复）
+      }
+    });
+
+    // 键盘：F 全屏 · R 回位（不干扰输入框）
+    window.addEventListener('keydown', (ev) => {
+      if (ev.target && /INPUT|TEXTAREA/.test(ev.target.tagName)) return;
+      const k = ev.key.toLowerCase();
+      if (k === 'f') toggleFullscreen();
+      else if (k === 'r') goHome();
+    });
 
     function endpoint(path) { return base + path; }
     function authPath(path) {
@@ -354,6 +528,11 @@
       const e = tierExposure(camera.position);
       if (e > 0) payload.exposure = e;
       dbg.lastExposure = e;
+      // 自动档下滑条跟随当前有效曝光（手动时用户在拖，不打扰）
+      if (autoOn) {
+        expSlider.value = e;
+        expLabel.textContent = e.toFixed(1);
+      }
       postJson('/api/sessions/' + sessionId + '/render', payload)
         .then((result) => {
           lastSubmitOk = true;
@@ -436,17 +615,7 @@
         fetch(endpoint(authPath('/api/sessions/' + sessionId)))
           .then((response) => response.json())
           .then((info) => {
-            const c = info.camera;
-            const pos = new THREE.Vector3(c.position[0], c.position[1], c.position[2]);
-            const dir = new THREE.Vector3(c.direction[0], c.direction[1], c.direction[2]).normalize();
-            const maxSyncDist = Math.max(1, parseFloat(params.get('targetDist')) || 4);
-            const dist = Math.min(
-              Math.max(1, camera.position.distanceTo(controls.target)), maxSyncDist);
-            camera.position.copy(pos);
-            controls.target.copy(pos.clone().add(dir.multiplyScalar(dist)));
-            camera.fov = c.fov;
-            camera.updateProjectionMatrix();
-            controls.update();
+            applySessionCamera(info);          // 同步轨道 + 缓存标定机位（R 回位用）
             // 室内自动提亮档参数（server 从 preset 下发；indoorExposure 0 = 无）
             autoExposure = {
               base: info.exposure || 1.0,
@@ -455,6 +624,11 @@
               max: info.indoorMax || [0, 0, 0],
               margin: info.indoorMargin || 1.5
             };
+            // 自动档下把滑条/读数同步到当前基准曝光
+            if (autoOn) {
+              expSlider.value = autoExposure.base;
+              expLabel.textContent = autoExposure.base.toFixed(1);
+            }
             setBar(0);
             show(model + ' ready');
             scheduleDrag();
