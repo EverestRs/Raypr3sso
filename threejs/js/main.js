@@ -181,8 +181,9 @@
   function createRemoteClient(baseUrl, camera, controls) {
     const base = baseUrl.replace(/\/$/, '');
     const params = new URLSearchParams(location.search);
-    // 展示默认：合并内外景（?model= 可切 bistro-interior / sphere-test）
-    const model = params.get('model') || 'bistro';
+    // 展示默认：合并内外景（?model= 可切 bistro-interior / sphere-test），
+    // P1 场景切换器运行时可改（同步回 URL）
+    let model = params.get('model') || 'bistro';
     // 访问 token（设计 13）：服务端启动时生成/由 RENDER_TOKEN 指定，
     // 通过页面 URL ?token= 传入，附加到所有 HTTP/WS/图片请求。
     // 展示缺省 devtoken（demo.sh 的默认值）。
@@ -235,11 +236,15 @@
     let serverReady = false;
     let generation = 0;
     let socketWanted = false;
+    let sock = null;                 // WS 句柄（P1 场景切换时需要关闭旧连接）
     let connectAttempts = 0;
     // 旧帧丢弃（设计 8）：renderId + generation + sequence 三元组
     let submittedRenderId = null;
     let shownRenderId = null;
     let shownSequence = 0;
+    // P1 统计面板数据源：有效 spp / chunk 间隔（预览事件到达间隔中位数）
+    let lastSample = 0, lastBudget = 0, lastPrevT = 0;
+    const cadence = [];
     // 相机提交状态机
     let dragTimer = null;
     let idleTimer = null;
@@ -295,7 +300,29 @@
       .re-row .re-ev { min-width:28px; text-align:right; font-family:monospace; }
       .re-row label { display:flex; gap:4px; align-items:center; color:#cbd5e1;
         cursor:pointer; white-space:nowrap; }
-      .re-row input[type=checkbox] { accent-color:#60a5fa; }`;
+      .re-row input[type=checkbox] { accent-color:#60a5fa; }
+      .re-err { position:fixed; inset:0; z-index:12; display:flex; align-items:center;
+        justify-content:center; background:rgba(4,6,10,.55); }
+      .re-err[hidden] { display:none; }
+      .re-err .card { background:rgba(10,14,22,.95); border:1px solid rgba(148,163,184,.35);
+        border-radius:10px; padding:22px 26px; max-width:420px; text-align:center;
+        font:14px/1.7 system-ui,sans-serif; color:#e2e8f0; }
+      .re-err .card code { display:block; margin:10px 0 14px; padding:8px 10px;
+        background:rgba(148,163,184,.12); border-radius:5px; font:12px monospace;
+        color:#93c5fd; }
+      .re-err .card button { padding:7px 18px; border-radius:5px; cursor:pointer;
+        border:1px solid rgba(96,165,250,.5); background:rgba(96,165,250,.2);
+        color:#e2e8f0; font:13px system-ui,sans-serif; }
+      .re-err .card button:hover { background:rgba(96,165,250,.35); }
+      .re-hideui .re-chip, .re-hideui .re-ctl, .re-hideui .re-panel { display:none; }
+      @media (pointer: coarse) {
+        .re-chip { font-size:13px; }
+        .re-title { padding:10px 14px; }
+        .re-btn { width:44px; height:44px; }
+        .re-btn svg { width:20px; height:20px; }
+        .re-panel { width:262px; }
+        .re-status { width:300px; }
+      }`;
     document.head.appendChild(style);
 
     const title = document.createElement('div');
@@ -412,10 +439,10 @@
       qualityIdx = i;
       IDLE.width = QUALITIES[i].w;
       IDLE.height = QUALITIES[i].h;
-      params.set('idleRes', `${QUALITIES[i].w}x${QUALITIES[i].h}`);
-      history.replaceState(null, '', `${location.pathname}?${params}`);
+      syncUrl();
       panel.querySelectorAll('.re-q button')
         .forEach((b, j) => b.classList.toggle('on', j === i));
+      updateStats();
       if (serverReady) submitRender(IDLE);
     }
 
@@ -451,7 +478,7 @@
       expAuto.checked = false;
       // 防抖：拖动过程 input 高频触发，停手 250ms 后才提交一次精修
       if (expTimer) clearTimeout(expTimer);
-      expTimer = setTimeout(() => { if (serverReady) submitRender(IDLE); }, 250);
+      expTimer = setTimeout(() => { syncUrl(); if (serverReady) submitRender(IDLE); }, 250);
     });
     expAuto.addEventListener('change', () => {
       autoOn = expAuto.checked;
@@ -461,15 +488,119 @@
       } else if (serverReady) {
         submitRender(IDLE);                 // 回到自动档（室内提亮恢复）
       }
+      syncUrl();
     });
 
-    // 键盘：F 全屏 · R 回位（不干扰输入框）
+    // ---- P1-6 实时统计面板（与设置面板互斥，同位右侧）----
+    const statsPanel = document.createElement('div');
+    statsPanel.className = 're-panel';
+    statsPanel.hidden = true;
+    statsPanel.innerHTML = '<h4>实时统计</h4>'
+      + '<div class="re-row"><span>场景</span><b id="re-stat-model" style="margin-left:auto;font-weight:600"></b></div>'
+      + '<div class="re-row"><span>预览分辨率</span><b id="re-stat-res" style="margin-left:auto;font-weight:600"></b></div>'
+      + '<div class="re-row"><span>采样</span><b id="re-stat-spp" style="margin-left:auto;font-weight:600"></b></div>'
+      + '<div class="re-row"><span>chunk 间隔</span><b id="re-stat-cad" style="margin-left:auto;font-weight:600"></b></div>'
+      + '<div class="re-row"><span>曝光</span><b id="re-stat-exp" style="margin-left:auto;font-weight:600"></b></div>';
+    document.body.appendChild(statsPanel);
+    const stat = (id, v) => { const el = document.getElementById(id); if (el && v != null) el.textContent = v; };
+    function median(arr) {
+      if (!arr.length) return null;
+      const s = [...arr].sort((a, b) => a - b);
+      return s[s.length >> 1];
+    }
+    function updateStats() {
+      if (statsPanel.hidden) return;
+      stat('re-stat-model', model);
+      stat('re-stat-res', `${IDLE.width}×${IDLE.height}`);
+      stat('re-stat-spp', lastBudget > 0 ? `${lastSample}/${lastBudget} spp` : '—');
+      const m = median(cadence);
+      stat('re-stat-cad', m != null ? `${Math.round(m)} ms` : '—');
+      const e = tierExposure(camera.position);
+      stat('re-stat-exp', e > 0 ? e.toFixed(1) : (autoOn ? '自动' : '—'));
+    }
+    mkBtn('stats', '<svg viewBox="0 0 24 24"><line x1="5" y1="20" x2="5" y2="12"/><line x1="12" y1="20" x2="12" y2="6"/><line x1="19" y1="20" x2="19" y2="10"/></svg>',
+          '实时统计', () => {
+            statsPanel.hidden = !statsPanel.hidden;
+            panel.hidden = true;
+            if (!statsPanel.hidden) updateStats();
+          });
+
+    // ---- P1-7 场景切换器（设置面板内一行）----
+    const SCENES = [
+      { name: '内外景', id: 'bistro' },
+      { name: '内景', id: 'bistro-interior' },
+      { name: '测试球', id: 'sphere-test' }
+    ];
+    const sceneRow = panel.querySelector('.re-row');
+    const sceneWrap = document.createElement('div');
+    sceneWrap.innerHTML = '<h4 style="margin-top:12px">场景</h4><div class="re-q" id="re-scene"></div>';
+    panel.insertBefore(sceneWrap, sceneRow);
+    function syncSceneButtons() {
+      document.querySelectorAll('#re-scene button')
+        .forEach(b => b.classList.toggle('on', b.dataset.model === model));
+    }
+    SCENES.forEach(s => {
+      const b = document.createElement('button');
+      b.textContent = s.name; b.dataset.model = s.id;
+      b.classList.toggle('on', s.id === model);
+      b.addEventListener('click', () => switchScene(s.id));
+      sceneWrap.lastElementChild.appendChild(b);
+    });
+    function switchScene(m) {
+      if (m === model) return;
+      model = m;
+      serverReady = false;
+      autoExposure = null;
+      setBar(null);
+      overlay.hidden = true;               // 旧场景帧不再代表新场景
+      show('切换 ' + model);
+      // 关旧链 + 关旧 WS（先摘 onclose 防止触发重连逻辑）
+      if (sessionId) fetch(endpoint(authPath(`/api/sessions/${sessionId}/cancel`)),
+                           { method: 'POST' }).catch(() => {});
+      socketWanted = false;
+      if (sock) { sock.onclose = null; try { sock.close(); } catch (_) {} sock = null; }
+      syncUrl();
+      syncSceneButtons();
+      updateStats();
+      createSession();
+    }
+
+    // ---- P1-10 URL 状态同步（分享当前画面设置）----
+    function syncUrl() {
+      params.set('model', model);
+      params.set('idleRes', `${IDLE.width}x${IDLE.height}`);
+      if (!autoOn && manualExp > 0) params.set('exposure', manualExp);
+      else params.delete('exposure');
+      history.replaceState(null, '', `${location.pathname}?${params}`);
+    }
+
+    // ---- P1-9 连接失败错误卡片 ----
+    const errCard = document.createElement('div');
+    errCard.className = 're-err';
+    errCard.hidden = true;
+    errCard.innerHTML = '<div class="card"><b>无法连接渲染服务端</b>'
+      + '<span style="display:block;color:#94a3b8;font-size:12px;margin-top:6px">'
+      + '正在自动重试。也可以在仓库根目录手动启动：</span>'
+      + '<code>./demo.sh</code>'
+      + '<button id="re-err-retry">立即重试</button></div>';
+    document.body.appendChild(errCard);
+    errCard.querySelector('#re-err-retry').addEventListener('click', () => {
+      if (retryTimer) { clearTimeout(retryTimer); retryTimer = null; }
+      createSession();
+    });
+
+    // 键盘：F 全屏 · R 回位 · 1-4 质量档 · H 隐藏 UI（不干扰输入框）
     window.addEventListener('keydown', (ev) => {
       if (ev.target && /INPUT|TEXTAREA/.test(ev.target.tagName)) return;
       const k = ev.key.toLowerCase();
       if (k === 'f') toggleFullscreen();
       else if (k === 'r') goHome();
+      else if (k === 'h') document.body.classList.toggle('re-hideui');
+      else if (k >= '1' && k <= '4') setQuality(parseInt(k, 10) - 1);
     });
+    // 触控适配：粗指针下芯片放大、提示换触控文案
+    if (window.matchMedia && matchMedia('(pointer: coarse)').matches)
+      hint.textContent = '单指 环视 · 双指 缩放 · 停手自动精修';
 
     function endpoint(path) { return base + path; }
     function authPath(path) {
@@ -518,6 +649,7 @@
 
     let lastSubmitOk = false;
     function submitRender(tier) {
+      if (!serverReady) return;   // P1：断线/场景切换期间不提交（防杂散请求）
       if (postInFlight) { dbg.skippedInFlight++; dirty = true; return; }
       dbg.submits++;
       postInFlight = true;
@@ -643,6 +775,11 @@
         if (msg.generation < generation) return;
         if (msg.renderId === shownRenderId && msg.sequence <= shownSequence) return;
         if (!msg.previewUrl) return;
+        // P1 统计：chunk 间隔（预览事件到达时刻）+ 采样计数
+        const nowT = performance.now();
+        if (lastPrevT) { cadence.push(nowT - lastPrevT); if (cadence.length > 8) cadence.shift(); }
+        lastPrevT = nowT;
+        lastSample = msg.sample; lastBudget = msg.sampleBudget;
         // 批1：预解码后再上屏（img.decode）——高频 JPEG 换帧不再出现
         // 半解码闪烁；晚到的旧解码被 sequence 检查丢弃。
         const url = new URL(authPath(msg.previewUrl), base).toString();
@@ -656,6 +793,7 @@
           shownSequence = seq;
           setBar(msg.sampleBudget > 0 ? msg.sample / msg.sampleBudget : null);
           show(model + ' spp ' + msg.sample + '/' + msg.sampleBudget);
+          updateStats();
         };
         probe.onerror = () => {};
         probe.src = url;
@@ -677,15 +815,15 @@
 
     function connect() {
       if (!socketWanted || !sessionId) return;
-      const socket = new WebSocket(websocketUrl());
-      socket.onopen = () => {
+      sock = new WebSocket(websocketUrl());
+      sock.onopen = () => {
         connectAttempts = 0;
         show(serverReady ? 'connected' : 'loading ' + model);
       };
-      socket.onmessage = (e) => {
+      sock.onmessage = (e) => {
         try { onEvent(JSON.parse(e.data)); } catch (_) { /* 非 JSON 帧忽略 */ }
       };
-      socket.onclose = () => {
+      sock.onclose = () => {
         if (!socketWanted) return;
         show('reconnecting');
         // 服务端重启等导致 session 丢失时，重建 session 再连。重建前先取消
@@ -703,26 +841,33 @@
         }
         setTimeout(connect, Math.min(1000 * connectAttempts, 5000));
       };
-      socket.onerror = () => { try { socket.close(); } catch (_) {} };
+      sock.onerror = () => { try { sock.close(); } catch (_) {} };
     }
 
+    let retryTimer = null;
     function createSession() {
       shownRenderId = null;
       shownSequence = 0;
       submittedRenderId = null;
       serverReady = false;
+      setBar(null);
+      errCard.hidden = true;
       postJson('/api/sessions', { model: model })
         .then((result) => {
-          if (!result.sessionId) { show('rejected: ' + (result.error || '?')); return; }
+          if (!result.sessionId) { errCard.hidden = false; show('rejected: ' + (result.error || '?')); return; }
           sessionId = result.sessionId;
           generation = 0;
           socketWanted = true;
+          errCard.hidden = true;
           show('loading ' + model);
           connect();
         })
         .catch(() => {
+          // P1-9：连接失败 → 居中错误卡片（保持 2s 自动重试，卡片可手动触发）
           show('unavailable, retrying');
-          setTimeout(createSession, 2000);
+          errCard.hidden = false;
+          if (retryTimer) clearTimeout(retryTimer);
+          retryTimer = setTimeout(createSession, 2000);
         });
     }
 
