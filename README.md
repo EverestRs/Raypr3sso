@@ -223,15 +223,20 @@ python3 -m http.server 8080 &
 xdg-open "http://127.0.0.1:8080/threejs/index.html?remote=http://127.0.0.1:9151&model=bistro&token=devtoken"
 ```
 
-交互：拖动=环视（拖动档 320×180@8spp 即时预览），停止=精修档 640×360@128spp+降噪；
+交互：拖动=环视（拖动档 320×180@8spp 即时预览），停止=精修档 960×540@128spp+降噪；
 滚轮=沿视线进出（内↔外）。**室内自动提亮**：相机进入内景 FBX 包围盒（1.5m smoothstep
 过渡带）时显示曝光从 2.5 平滑升到 6.0（display-only，不重置累积），出门自动回落——
 `bistro` preset 携带该档参数，服务端经 session JSON 下发，客户端按相机位置逐帧混合。
-相机参数可经 URL 覆盖：`&targetDist=12`（轨道目标距离，默认 4m 房间尺度）、
-`&exposure=1.75`（手动曝光，设置后禁用室内自动档）。场景注册表（`render_server.cpp` kModels）：
-`sphere-test` / `bistro-interior`（纯内景）/ `bistro`（内外合一 + kloppenheim 白天 HDRI）。
-端到端验证脚本：`scripts/test_midmove_ab.py`（渲染中拖相机 A/B）、
-`scripts/e2e_bistro_combined.py`（无头浏览器内→外切换 + 自动提亮断言；依赖同目录 `e2e_cdp_helper.py`）。
+**右上控制栈**：保存当前帧（无损 PNG）/ 回到标定机位（R）/ 实时统计面板（分辨率·有效
+spp·chunk 间隔·曝光）/ 全屏（F）/ 质量·曝光面板（精修分辨率四档即时切换 + 曝光滑条
+自动/手动）；键盘 1-4 切画质、H 隐藏 UI；断线显示错误卡片（引用 `./demo.sh`）。
+所有设置同步进 URL（model/idleRes/exposure），画面可直接分享。相机参数可经 URL 覆盖：
+`&targetDist=12`（轨道目标距离，默认 4m 房间尺度）。场景注册表（`render_server.cpp`
+kModels）：`sphere-test` / `bistro-interior`（纯内景）/ `bistro`（内外合一 + kloppenheim
+白天 HDRI），设置面板内可切换。端到端验证脚本：`scripts/test_midmove_ab.py`（渲染中
+拖相机 A/B）、`scripts/e2e_bistro_combined.py`（内→外切换 + 自动提亮断言）、
+`scripts/e2e_p0_ui.py` / `scripts/e2e_p1_ui.py`（控制项交互验收；依赖同目录
+`e2e_cdp_helper.py`）。
 
 ### 第三步：渲染
 
