@@ -1,0 +1,28 @@
+# ---- 构建产物 ----
+build/
+
+# ---- 场景资产（~1.8GB）：从 NVIDIA ORCA 下载，见 README"可用模型" ----
+models/
+
+# ---- 渲染输出（工作目录；精选成果在 gallery/）----
+output/
+output_cpu/
+output_gpu/
+output_review/
+
+# ---- 第三方预编译二进制（OIDN 可选依赖，~80MB）----
+external/oidn/
+
+# ---- 参考实现的工作目录与二进制（保留 src/docs）----
+reference/build/
+reference/lib/
+reference/output/
+reference/Demo
+reference/FXAA
+reference/models
+reference/*.png
+
+# ---- 会话与临时文件 ----
+.zcode/
+*.log
+*.tmp

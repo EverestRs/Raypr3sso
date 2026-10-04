@@ -1,0 +1,35 @@
+# RenderEngine 远程渲染服务 systemd 单元（设计 12 生产环境）
+#
+# 安装：
+#   sudo cp deploy/render_server.service /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now render_server
+#
+# token：启动时由服务生成并打印到 journal（journalctl -u render_server |
+#        grep "auth token"），或用 Environment=RENDER_TOKEN=... 固定。
+# 绑定：服务只监听 127.0.0.1，TLS 由反向代理（见 deploy/nginx-render.conf）负责。
+
+[Unit]
+Description=RenderEngine remote path-tracing service
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=render
+Group=render
+WorkingDirectory=/opt/renderengine
+ExecStart=/opt/renderengine/build/render_server 127.0.0.1 9000
+Restart=always
+RestartSec=3
+# 安全基线（设计 13）
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/opt/renderengine/output
+PrivateTmp=true
+Environment=RENDER_SESSION_TTL=900
+Environment=RENDER_RENDER_TIMEOUT=600
+# Environment=RENDER_TOKEN=<固定 token，多实例时使用>
+# Environment=RENDER_ORIGINS=https://render.example.com
+
+[Install]
+WantedBy=multi-user.target
