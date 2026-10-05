@@ -195,7 +195,8 @@
     // 320×180 下仍然即时。IDLE 档走渐进链（progressive:1，几何 chunk 计划
     // 2,4,8,16,...），分辨率默认 960×540（&idleRes=1280x720 可调）。
     // NEE K 维持服务端默认（K 是全局符号，跨 session 配置有竞争，暂不开放）。
-    const DRAG = { width: 320, height: 180, sppBudget: 8, maxDepth: 4, chunkSpp: 8, neeK: 1 };
+    const DRAG = { width: 320, height: 180, sppBudget: 8, maxDepth: 4,
+                   neeK: 1, denoise: 1, progressive: 1 };
     const idleRes = (params.get('idleRes') || '960x540')
       .split('x').map(v => Math.max(16, parseInt(v, 10) || 0));
     const IDLE = { width: idleRes[0] || 960, height: idleRes[1] || 540,
@@ -263,7 +264,7 @@
     const overlay = document.createElement('img');
     overlay.alt = '';
     overlay.hidden = true;
-    overlay.style.cssText = 'position:fixed;inset:0;width:100%;height:100%;object-fit:contain;pointer-events:none;z-index:10;';
+    overlay.style.cssText = 'position:fixed;inset:0;width:100%;height:100%;object-fit:contain;pointer-events:none;z-index:10;transition:filter .25s ease-out;';
     document.body.appendChild(overlay);
 
     // ---- 展示 UI 包装（批：可展示性）----
@@ -414,6 +415,15 @@
         .finally(() => { saving = false; });
     }
 
+    // ---- 模糊→清晰（反馈：移动视角后由模糊变清晰，而非黑屏到出现）----
+    // 拖动档帧固定 4px 模糊（低 spp 的"大概"观感）；精修帧随 spp 5→0px；
+    // 相机一开始移动就把当前（旧）帧糊 4px——旧帧全程保留，不出现黑屏。
+    function applyBlur(sample, budget) {
+      if (abOn) { overlay.style.filter = ''; return; }
+      const frac = budget > 0 ? sample / budget : 1;
+      const blurPx = budget <= 16 ? 4 : 5 * (1 - Math.min(1, frac));
+      overlay.style.filter = `blur(${Math.max(0, blurPx).toFixed(1)}px)`;
+    }
     let presetCam = null;   // session-ready 时的标定机位（服务端 preset）
     function applySessionCamera(info) {
       const c = info.camera;
@@ -808,6 +818,7 @@
     controls.addEventListener('start', () => {
       interacting = true;
       if (idleTimer) { clearTimeout(idleTimer); idleTimer = null; }
+      if (serverReady && !overlay.hidden && !abOn) overlay.style.filter = 'blur(4px)';
       if (serverReady) scheduleDrag();
     });
     controls.addEventListener('change', () => {
@@ -890,6 +901,7 @@
           overlay.hidden = false;
           shownRenderId = rid;
           shownSequence = seq;
+          applyBlur(msg.sample, msg.sampleBudget);
           setBar(msg.sampleBudget > 0 ? msg.sample / msg.sampleBudget : null);
           const eta = etaSeconds();
           show(model + ' spp ' + msg.sample + '/' + msg.sampleBudget +
