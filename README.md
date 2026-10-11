@@ -1038,7 +1038,7 @@ RENDER_TONEMAP=aces RENDER_SKY_FOCUS_DIM=0.05 RENDER_SKY_FOCUS_CONE=15
 
 **太阳锥杀的正确用法**：`RENDER_SKY_FOCUS_DIM=0.999`（<1 即开 sunConeKill，但穹顶压暗量 0.1% 可忽略）——真实白天 HDRI 不需要聚焦压暗，只需要"HDRI 太阳盘不重复参与照明"。
 
-**标定矩阵**（480×270@64，分区中位数/官方，scripts/calibrate_daysky*.sh）：
+**标定矩阵**（480×270@64，分区中位数/官方，scripts/attic/calibrate_daysky*.sh）：
 
 | 配置 | median | cobbleFg(0.808) | facadeGreen(0.137) | awning(0.212) | vespa(0.351) |
 |---|---|---|---|---|---|
@@ -1117,7 +1117,7 @@ kernel 每像素循环内每 adaptiveCheck 个样本检查一次四个 AOV 亮�
 
 **P2 sun-keyed split-tone**：`RENDER_SPLIT_KEY=sun` 时暖/冷分区键从"显示亮度"换成 P1 的日光 matte（`sunnliness=blur(sunMask)/总亮度`，smoothstep）——暖只加在真受光像素、冷只加在阴影像素。原静态变量改为 `Photo.splitWarm/splitCool/splitKeySun` 渲染期字段（否则会话内 setenv 不生效，标定脚本实测发现）。
 
-**P3 自动标定（`scripts/calibrate_fit.py`）**：单会话（一次模型加载）内坐标下降扫 7 个渲染期参数（sun tint×3/WB/split×2/indirect），480p@64 每评估~13s，分区 log-luma + R/B 双项打分。完整 52 评估：score 7.24→**6.64**，最优 sun(1.03,0.85,0.70) wb0.5 split_w0.08 split_c0.07 ind0.48，写 `best_params.json`。
+**P3 自动标定（`scripts/attic/calibrate_fit.py`）**：单会话（一次模型加载）内坐标下降扫 7 个渲染期参数（sun tint×3/WB/split×2/indirect），480p@64 每评估~13s，分区 log-luma + R/B 双项打分。完整 52 评估：score 7.24→**6.64**，最优 sun(1.03,0.85,0.70) wb0.5 split_w0.08 split_c0.07 ind0.48，写 `best_params.json`。
 
 **P4a SSAO（`RENDER_AO=1`）**：位置缓冲切线平面遮挡（12 taps/半径12px，逐像素旋转去带），只作用间接通道（直接光已有追踪阴影）；OIDN 路径按像素间接占比折算施加。门框过亮 2.2×→1.9×。
 
