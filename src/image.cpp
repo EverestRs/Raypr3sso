@@ -253,7 +253,7 @@ void Photo::postProcess(int shadeOptions, int spp, int denoiseQuality) {
                 oidnSetSharedFilterImage(flt, "albedo", albedo.data(), OIDN_FORMAT_FLOAT3, width, height, 0, 3*sizeof(float), 0);
                 oidnSetSharedFilterImage(flt, "normal", normal.data(), OIDN_FORMAT_FLOAT3, width, height, 0, 3*sizeof(float), 0);
                 oidnSetSharedFilterImage(flt, "output", out.data(),    OIDN_FORMAT_FLOAT3, width, height, 0, 3*sizeof(float), 0);
-                oidnSetFilter1b(flt, "hdr", true);
+                oidnSetFilterBool(flt, "hdr", true);
                 oidnCommitFilter(flt);
                 oidnExecuteFilter(flt);
                 const char* err = nullptr;
@@ -839,7 +839,16 @@ void refreshRenderEnv() {
     }
     const char* t = std::getenv("RENDER_TONEMAP");
     g_useAcesTonemap = t && std::string(t) == "aces";
-    g_contrast = parseContrastCurve();
+    // The 1024-entry LUT rebuild is the only non-trivial work here — cache it
+    // keyed on the raw env value (re-parse ONLY when the operator changes it;
+    // same value => byte-identical curve, so behaviour is unchanged).
+    static std::string cachedCurveEnv;
+    const char* ce = std::getenv("RENDER_CURVE");
+    const std::string curveEnv = ce ? ce : "";
+    if (curveEnv != cachedCurveEnv) {
+        g_contrast = parseContrastCurve();
+        cachedCurveEnv = curveEnv;
+    }
 }
 
 void Photo::gammaCorrect() {

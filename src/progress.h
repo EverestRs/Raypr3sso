@@ -1,6 +1,6 @@
 #pragma once
 // Minimal terminal progress bar. Prints to stderr so it never collides with
-// the interactive "> " prompt on stdoutaine.
+// the interactive "> " prompt on stdout.
 #include <cstdio>
 #include <chrono>
 #include <algorithm>

@@ -1007,7 +1007,7 @@ void RenderServer::runRenderChunk(const ChunkTask& task, const RenderScheduler::
         // Terminal states (design 4.3): budget met -> completed, cancel
         // request -> canceled. Continue the chain otherwise; FIFO queue +
         // one chunk per job gives natural round-robin between sessions.
-        // (finalPng was stored by encodePreview's final-chunk branch — the
+        // (finalBytes was stored by encodePreview's final-chunk branch — the
         // lossless PNG must not be overwritten by the JPEG preview.)
         if (accumulated >= task.spp) {
             publishEvent(task.sessionId,
@@ -1137,7 +1137,7 @@ void RenderServer::encodePreview(const ChunkTask& task,
     // Progressive previews encode JPEG (quality 90 — 4-5x faster than PNG,
     // the frames are transient); the FINAL frame additionally encodes a
     // lossless PNG for GET /api/renders/{id}/image (delivery stays PNG).
-    std::vector<unsigned char> preview, finalPng;
+    std::vector<unsigned char> preview, finalBytes;
     auto writeBytes = [](void* context, void* data, int size) {
         auto* bytes = static_cast<std::vector<unsigned char>*>(context);
         const unsigned char* p = static_cast<const unsigned char*>(data);
@@ -1146,7 +1146,7 @@ void RenderServer::encodePreview(const ChunkTask& task,
     stbi_write_jpg_to_func(writeBytes, &preview, width, height, 3,
                            rgb.data(), 90);
     if (finalChunk)
-        stbi_write_png_to_func(writeBytes, &finalPng, width, height, 3,
+        stbi_write_png_to_func(writeBytes, &finalBytes, width, height, 3,
                                rgb.data(), width * 3);
     const bool perfLog = [] {
         const char* p = std::getenv("RENDER_PERF");
@@ -1155,7 +1155,7 @@ void RenderServer::encodePreview(const ChunkTask& task,
     if (perfLog)
         fprintf(stderr, "PERF encode %s: denoiseQ=%d bytes=%zu final=%d\n",
                 task.renderId.c_str(), denoiseQuality, preview.size(),
-                (int)finalPng.size());
+                (int)finalBytes.size());
 
     uint64_t sequence = 0;
     {
@@ -1163,7 +1163,7 @@ void RenderServer::encodePreview(const ChunkTask& task,
         auto it = sessions_.find(task.sessionId);
         if (it == sessions_.end()) return;
         SessionInfo& session = it->second;
-        session.previewPng = std::move(preview);
+        session.previewBytes = std::move(preview);
         session.previewWidth = width;
         session.previewHeight = height;
         session.previewSpp = task.ctx->nextSample();
@@ -1174,10 +1174,10 @@ void RenderServer::encodePreview(const ChunkTask& task,
             session.activeJob->progress().previewSequence = sequence;
         auto rit = renders_.find(task.renderId);
         if (rit != renders_.end()) {
-            rit->second.previewPng = session.previewPng;
+            rit->second.previewBytes = session.previewBytes;
             rit->second.previewSpp = session.previewSpp;
             rit->second.previewSequence = sequence;
-            if (finalChunk) rit->second.finalPng = std::move(finalPng);
+            if (finalChunk) rit->second.finalBytes = std::move(finalBytes);
         }
     }
     const int accumulated = task.ctx->nextSample();
@@ -1199,7 +1199,7 @@ std::string RenderServer::previewData(const std::string& id, int& status,
         status = 404;
         return R"({"error":"session_not_found"})";
     }
-    if (it->second.previewPng.empty()) {
+    if (it->second.previewBytes.empty()) {
         status = 404;
         return R"({"error":"no_preview"})";
     }
@@ -1207,7 +1207,7 @@ std::string RenderServer::previewData(const std::string& id, int& status,
     // Progressive previews encode JPEG (quality 90); the final /image stays
     // lossless PNG — see encodePreview.
     contentType = "image/jpeg";
-    return std::string(it->second.previewPng.begin(), it->second.previewPng.end());
+    return std::string(it->second.previewBytes.begin(), it->second.previewBytes.end());
 }
 
 std::string RenderServer::cancelSession(const std::string& id, int& status) {
@@ -1365,7 +1365,7 @@ std::string RenderServer::renderImage(const std::string& renderId, bool finalIma
         return R"({"error":"render_not_found"})";
     }
     const std::vector<unsigned char>& png =
-        finalImage ? it->second.finalPng : it->second.previewPng;
+        finalImage ? it->second.finalBytes : it->second.previewBytes;
     if (png.empty()) {
         status = 404;
         return R"({"error":"no_preview"})";

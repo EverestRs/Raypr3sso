@@ -132,10 +132,11 @@ private:
         // chain resumes at a stale sample index).
         bool pendingReset = false;
         // Latest progressive preview (design 5.2 staging buffer, 阶段三
-        // export point): PNG bytes re-encoded by the GPU worker at every
-        // chunk boundary; read by GET /api/sessions/{id}/preview. Guarded
-        // by mutex_.
-        std::vector<unsigned char> previewPng;
+        // export point): JPEG bytes re-encoded by the GPU worker at every
+        // chunk boundary (P1; the final chain frame ALSO encodes a lossless
+        // PNG into RenderRecord::finalBytes); read by GET
+        // /api/sessions/{id}/preview. Guarded by mutex_.
+        std::vector<unsigned char> previewBytes;
         int previewWidth = 0, previewHeight = 0;
         int previewSpp = 0;             // accumulated samples at encode time
         uint64_t previewGeneration = 0;
@@ -161,8 +162,8 @@ private:
             std::chrono::steady_clock::now();
         bool timedOut = false;   // chain exceeded the render timeout (13)
         RenderScheduler::Job job;
-        std::vector<unsigned char> previewPng;  // latest preview of this render
-        std::vector<unsigned char> finalPng;    // preview captured at chain end
+        std::vector<unsigned char> previewBytes;  // latest preview of this render (JPEG)
+        std::vector<unsigned char> finalBytes;  // lossless PNG captured at chain end
         int previewSpp = 0;
         uint64_t previewSequence = 0;
     };
