@@ -35,7 +35,7 @@ export RENDER_FIXTURE_GAIN=2.0
   echo "$OUT/mega_ad"
   echo "render bistro p4 gpu"
   echo "exit"
-} | ./build/RenderEngine 2>&1 | grep -E "ADAPTSTAT|AOVSTAT|Done in|CUDA ERROR|Output file"
+} | ./build/Raypr3sso 2>&1 | grep -E "ADAPTSTAT|AOVSTAT|Done in|CUDA ERROR|Output file"
 
 echo "=== md5 ==="
 md5sum $OUT/*/*.png

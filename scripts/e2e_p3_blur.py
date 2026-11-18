@@ -3,6 +3,7 @@
 denoised progressive frames, blur 0 after refine."""
 import json, os, subprocess, sys, time, urllib.request
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 import e2e_cdp_helper as cdp_check
 from e2e_cdp_helper import Cdp
 cdp_check.CHROME_PORT = 9232
@@ -19,7 +20,7 @@ def filter_now(cdp):
 
 def main():
     httpd = subprocess.Popen([sys.executable,"-m","http.server","8080"],
-        cwd="/home/biwenbin/VSCodeProjects/RenderEngine",
+        cwd=REPO,
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     subprocess.run(["rm","-rf","/tmp/wf_e2e/profile_p3"])
     chrome = subprocess.Popen(["google-chrome","--headless=new","--no-sandbox","--disable-gpu",
@@ -37,7 +38,7 @@ def main():
         time.sleep(2)
         title = cdp.evaluate("JSON.stringify(document.title)")
         print("title:", title)
-        ok &= "RenderEngine" in title
+        ok &= "Raypr3sso" in title
         for _ in range(240):
             time.sleep(1)
             st = status(cdp)

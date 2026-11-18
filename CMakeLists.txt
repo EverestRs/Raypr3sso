@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.18)
-project(RenderEngine
+project(Raypr3sso
     VERSION 0.1.0
     DESCRIPTION "CUDA Path Tracing Renderer"
     LANGUAGES CXX CUDA
@@ -129,7 +129,7 @@ set(CUDA_SOURCES
 )
 
 # ---- Main Executable ----
-add_executable(RenderEngine ${SOURCES} ${CUDA_SOURCES})
+add_executable(Raypr3sso ${SOURCES} ${CUDA_SOURCES})
 
 add_executable(render_server
     src/render_server_main.cpp
@@ -167,51 +167,51 @@ endif()
 # needs PTX (sm_70 is not supported by CUDA 13.0's SASS compiler).
 # Instead, bvh_gpu.cu is #included from render_gpu.cu to avoid cross-file
 # device function calls.
-# set_property(TARGET RenderEngine PROPERTY CUDA_SEPARABLE_COMPILATION ON)
+# set_property(TARGET Raypr3sso PROPERTY CUDA_SEPARABLE_COMPILATION ON)
 
-target_include_directories(RenderEngine PRIVATE
+target_include_directories(Raypr3sso PRIVATE
     ${CMAKE_SOURCE_DIR}/src
     ${CMAKE_SOURCE_DIR}/include
 )
 
-target_link_libraries(RenderEngine PRIVATE
+target_link_libraries(Raypr3sso PRIVATE
     glm
     stb
     Threads::Threads
 )
 if(assimp_FOUND)
-    target_link_libraries(RenderEngine PRIVATE assimp::assimp)
+    target_link_libraries(Raypr3sso PRIVATE assimp::assimp)
 endif()
 
 if(OIDN_DIRS)
-    target_include_directories(RenderEngine PRIVATE "${OIDN_INCLUDE_DIR}")
-    target_link_libraries(RenderEngine PRIVATE "${OIDN_LIB}")
-    set_target_properties(RenderEngine PROPERTIES
+    target_include_directories(Raypr3sso PRIVATE "${OIDN_INCLUDE_DIR}")
+    target_link_libraries(Raypr3sso PRIVATE "${OIDN_LIB}")
+    set_target_properties(Raypr3sso PROPERTIES
         BUILD_RPATH "${OIDN_DIR}/lib"
         INSTALL_RPATH "${OIDN_DIR}/lib")
 endif()
 
 if(RENDERER_USE_TINYEXR)
-    target_link_libraries(RenderEngine PRIVATE tinyexr)
-    target_compile_definitions(RenderEngine PRIVATE RENDERER_HAS_TINYEXR)
+    target_link_libraries(Raypr3sso PRIVATE tinyexr)
+    target_compile_definitions(Raypr3sso PRIVATE RENDERER_HAS_TINYEXR)
 endif()
 
 # ---- CUDA specific flags ----
-target_compile_options(RenderEngine PRIVATE
+target_compile_options(Raypr3sso PRIVATE
     $<$<COMPILE_LANGUAGE:CUDA>:--extra-device-vectorization>
     $<$<COMPILE_LANGUAGE:CUDA>:-lineinfo>
 )
 
 # ---- Platform specific ----
 if(WIN32)
-    target_compile_definitions(RenderEngine PRIVATE _USE_MATH_DEFINES)
+    target_compile_definitions(Raypr3sso PRIVATE _USE_MATH_DEFINES)
 endif()
 
 # ---- Install ----
-install(TARGETS RenderEngine DESTINATION bin)
+install(TARGETS Raypr3sso DESTINATION bin)
 
 # ---- Print config summary ----
-message(STATUS "RenderEngine Configuration:")
+message(STATUS "Raypr3sso Configuration:")
 message(STATUS "  CUDA Architecture : ${CUDA_ARCH}")
 message(STATUS "  tinyexr support   : ${RENDERER_USE_TINYEXR}")
 message(STATUS "  Build type        : ${CMAKE_BUILD_TYPE}")

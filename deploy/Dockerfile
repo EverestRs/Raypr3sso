@@ -1,9 +1,9 @@
-# RenderEngine 渲染服务容器（设计 12；需要 nvidia-container-toolkit）
+# Raypr3sso 渲染服务容器（设计 12；需要 nvidia-container-toolkit）
 #
-#   docker build -t renderengine-server -f deploy/Dockerfile .
+#   docker build -t raypr3sso-server -f deploy/Dockerfile .
 #   docker run --gpus all -p 127.0.0.1:9000:9000 \
-#     -e RENDER_TOKEN=<token> -v bistro-cache:/opt/renderengine/models \
-#     renderengine-server
+#     -e RENDER_TOKEN=<token> -v bistro-cache:/opt/raypr3sso/models \
+#     raypr3sso-server
 #
 # 注意：模型文件（models/Bistro_v5_2）不入镜像，挂载只读卷提供。
 
@@ -24,7 +24,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         libassimp5 zlib1g libjpeg8 libpng16-16 \
     && rm -rf /var/lib/apt/lists/* \
     && useradd -r -u 900 render
-WORKDIR /opt/renderengine
+WORKDIR /opt/raypr3sso
 COPY --from=build /src/build/render_server ./build/render_server
 COPY models ./models
 USER render

@@ -36,7 +36,7 @@ fi
   echo "$OUT"
   echo "render bext final gpu"
   echo "exit"
-} | ./build/RenderEngine 2>&1 | tee $OUT/render_log.txt | grep -E "Rig installed|ADAPTSTAT|AOVSTAT|SUNMASK|OIDN|AO:|DENOISE done|Done in|Output file|CUDA ERROR|NOTE:"
+} | ./build/Raypr3sso 2>&1 | tee $OUT/render_log.txt | grep -E "Rig installed|ADAPTSTAT|AOVSTAT|SUNMASK|OIDN|AO:|DENOISE done|Done in|Output file|CUDA ERROR|NOTE:"
 
 echo "=== done ==="
 ls -la $OUT/*.png

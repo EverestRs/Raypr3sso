@@ -1,4 +1,4 @@
-# RenderEngine — CUDA 路径追踪渲染器 + 浏览器实时查看
+# Raypr3sso — CUDA 路径追踪渲染器 + 浏览器实时查看
 
 **一句话**：从零实现的 CUDA 路径追踪渲染器（Disney BSDF / MIS / BVH / 波前管线 / 自研降噪与调色），
 对标 NVIDIA 官方 Bistro 渲染图逐区域校准，并通过内置的远程渲染服务在浏览器里
@@ -62,12 +62,12 @@
 
 ---
 
-**RenderEngine** 是一款基于 CUDA 的离线路径追踪渲染器，支持 CPU + GPU (CUDA) 双后端，实现 Disney BSDF、BVH 加速、多重重要性采样（MIS）等核心渲染技术。目标场景为 [Amazon Lumberyard Bistro](https://developer.nvidia.com/orca/amazon-lumberyard-bistro) 开源场景。
+**Raypr3sso** 是一款基于 CUDA 的离线路径追踪渲染器，支持 CPU + GPU (CUDA) 双后端，实现 Disney BSDF、BVH 加速、多重重要性采样（MIS）等核心渲染技术。目标场景为 [Amazon Lumberyard Bistro](https://developer.nvidia.com/orca/amazon-lumberyard-bistro) 开源场景。
 
 ## 目录结构
 
 ```
-RenderEngine/
+Raypr3sso/
 ├── CMakeLists.txt         # 构建文件
 ├── external/              # 第三方库 (glm, stb)
 ├── src/                   # 源码
@@ -102,12 +102,13 @@ RenderEngine/
 | assimp | ≥ 5.x | `apt install libassimp-dev` |
 | glm | header-only | FetchContent 自动拉取 |
 | stb | header-only | FetchContent 自动拉取 |
+| OIDN（可选） | 2.2.0 预编译 | 手动安装见[「可选：OIDN 降噪器」](#可选oidn-降噪器)；不装自动回退自研 NL-means |
 
 ## 编译方式
 
 ```bash
 # 克隆项目后
-cd RenderEngine
+cd Raypr3sso
 mkdir -p build && cd build
 
 # 配置（默认 CUDA 架构 sm_70，适用于 Tesla V100）
@@ -119,7 +120,7 @@ cmake .. -DCMAKE_BUILD_TYPE=Release -DCUDA_ARCH=86
 # 编译
 make -j$(nproc)
 
-# 产物位于 build/RenderEngine
+# 产物位于 build/Raypr3sso
 ```
 
 ### CMake 选项
@@ -130,6 +131,27 @@ make -j$(nproc)
 | `-DRENDERER_USE_TINYEXR=OFF` | OFF | 开启 EXR 输出支持 |
 | `-DCMAKE_BUILD_TYPE=Release` | — | Release 模式开启 O2 优化 |
 
+### 可选：OIDN 降噪器
+
+自研 NL-means 开箱即用；安装 Intel [OIDN](https://www.openimagedenoise.org/)（机器学习
+降噪，albedo+normal 引导）后可用 `RENDER_OIDN=1` 获得更好的精修终帧质量（自适应采样
+也只在 OIDN 可用时启用）。OIDN 为**可选**依赖，不安装不影响编译与其余功能。
+
+```bash
+# 从官方 releases 页下载 Linux x64 预编译包：
+# https://github.com/AcademySoftwareFoundation/OpenImageDenoise/releases/tag/v2.2.0
+# （资产名 oidn-2.2.0.x86_64.linux.tar.gz，约 80MB）
+mkdir -p external/oidn
+tar xzf oidn-2.2.0.x86_64.linux.tar.gz -C external/oidn
+
+# 重新 cmake 配置；探测成功会打印：
+#   -- Found OIDN at .../external/oidn/oidn-2.2.0.x86_64.linux — RENDER_OIDN enabled
+```
+
+CMake 配置时自动探测 `external/oidn/oidn-*.x86_64.linux/`（解压出的目录名必须符合该
+模式）并链接 + 设置 RPATH；目录缺失或不匹配时静默跳过，`RENDER_OIDN=1` 自动回退
+自研 NL-means。该目录已被 `.gitignore` 排除，不随仓库分发。
+
 ## 使用方法
 
 渲染器采用交互式控制台，支持管道输入。分为三个步骤：
@@ -138,11 +160,11 @@ make -j$(nproc)
 
 ```bash
 # 交互模式
-./build/RenderEngine
+./build/Raypr3sso
 > create model bistro
 
 # 或在启动时通过命令行指定参数（单行格式）
-./build/RenderEngine <<< 'create model bistro models/Bistro_v5_2 BistroInterior_Wine.fbx null'
+./build/Raypr3sso <<< 'create model bistro models/Bistro_v5_2 BistroInterior_Wine.fbx null'
 ```
 
 模型参数说明：
@@ -195,7 +217,7 @@ ACES、WB、饱和度、split-tone、LUT 曲线/分带、OIDN、自适应采样�
 ```bash
 ./scripts/render_bistro_official_match.sh          # 1080p 自适应 2048 预算，~30-70 分钟
 # 或交互式：
-./build/RenderEngine << 'EOF'
+./build/Raypr3sso << 'EOF'
 preset daylight myargs
 create model bext models/Bistro_v5_2 BistroExterior.fbx models/Bistro_v5_2/qwantani_azm55_4k.hdr
 render bext myargs gpu
@@ -254,7 +276,7 @@ kModels）：`sphere-test` / `bistro-interior`（纯内景）/ `bistro`（内外
 ### 完整渲染命令（管道模式）
 
 ```bash
-./build/RenderEngine << 'EOF'
+./build/Raypr3sso << 'EOF'
 create model bistro models/Bistro_v5_2 BistroInterior_Wine.fbx null
 preset interior myargs
 render bistro myargs gpu
@@ -353,10 +375,10 @@ vfov = 2 * atan(0.36864) * 180/π ≈ 40.5°
 
 ##### Up 向量取反原因
 
-参考项目使用 Y-down 屏幕空间，`up` 向量指向画面下方；RenderEngine 使用 Y-up 屏幕空间，`up` 向量应指向上方。因此对参考项目的 `up` 取反，同时在水平方向上也自动纠正 `right = cross(direction, up)` 的符号：
+参考项目使用 Y-down 屏幕空间，`up` 向量指向画面下方；Raypr3sso 使用 Y-up 屏幕空间，`up` 向量应指向上方。因此对参考项目的 `up` 取反，同时在水平方向上也自动纠正 `right = cross(direction, up)` 的符号：
 
 ```
-RenderEngine up = -reference_up
+Raypr3sso up = -reference_up
                = (0.104761, 0.99449, -0.00377383)
 ```
 
@@ -400,7 +422,7 @@ RenderEngine up = -reference_up
 
 关键差异：
 
-| 特性 | RenderEngine | Raym0nade (参考) |
+| 特性 | Raypr3sso | Raym0nade (参考) |
 |------|-------------|------------------|
 | 后端 | CPU + GPU (CUDA) | CPU 多线程 |
 | BVH | Linear BVH (GPU) | 递归 BVH (CPU) |
@@ -445,7 +467,7 @@ Bistro 内景 ~1.32M 面，纹理 ~200 张，GPU 显存占用约 15GB（V100 32G
 
 # 技术报告：渲染管线实现详解
 
-本报告记录 RenderEngine 渲染管线的完整实现方法、设计思路与实现细节，包括在将 Bistro 内景渲染对齐 NVIDIA 官方效果图过程中做的全部工程决策、踩坑记录与量化验证结果。所有数字均为实测值。
+本报告记录 Raypr3sso 渲染管线的完整实现方法、设计思路与实现细节，包括在将 Bistro 内景渲染对齐 NVIDIA 官方效果图过程中做的全部工程决策、踩坑记录与量化验证结果。所有数字均为实测值。
 
 ---
 
@@ -535,7 +557,7 @@ Bistro 内景（`BistroInterior.fbx`）经 assimp 加载，后处理 flag：`aiP
 
 # 技术报告：渲染管线实现详解
 
-> 本报告详细记录 RenderEngine 的渲染管线实现方法、设计思路与关键实现细节，涵盖从资产加载到最终输出的全链路，以及调试方法论、与 NVIDIA 官方 Bistro 渲染图的量化对齐结果。
+> 本报告详细记录 Raypr3sso 的渲染管线实现方法、设计思路与关键实现细节，涵盖从资产加载到最终输出的全链路，以及调试方法论、与 NVIDIA 官方 Bistro 渲染图的量化对齐结果。
 
 ---
 

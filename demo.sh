@@ -8,9 +8,9 @@ PORT=${PORT:-9151}
 WEB=${WEB:-8080}
 TOKEN=${TOKEN:-devtoken}
 MODEL=${MODEL:-bistro}          # bistro = 内外景合一 | bistro-interior = 纯内景
-LOG=/tmp/renderengine_demo_server.log
+LOG=/tmp/raypr3sso_demo_server.log
 
-echo "== RenderEngine demo =="
+echo "== Raypr3sso demo =="
 echo "服务端端口 $PORT · 静态页端口 $WEB · 模型 $MODEL"
 
 # ---- 1) GPU 预检（演示事故预防：显存被其他进程占用会白屏/失败）----

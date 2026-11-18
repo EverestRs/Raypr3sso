@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """P3: automated daylight grade fitting (坐标下降，分区对官方拟合).
 
-Drives ONE RenderEngine console session (model loaded once), renders
+Drives ONE Raypr3sso console session (model loaded once), renders
 480x270@64 per evaluation, and coordinate-descends the RENDER-TIME env knobs
 (sun tint, WB, split-tone, indirect scale) to minimise a zone score against
 the official reference. Load-time knobs (sky scale/tint) are fixed to the
@@ -14,7 +14,7 @@ import numpy as np
 from PIL import Image
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-BIN = os.path.join(ROOT, 'build', 'RenderEngine')
+BIN = os.path.join(ROOT, 'build', 'Raypr3sso')
 REF = os.path.join(ROOT, 'reference', 'official_bistro_daylight.png')
 WORK = os.path.join(ROOT, 'output_gpu', 'calib_fit')
 os.makedirs(WORK, exist_ok=True)

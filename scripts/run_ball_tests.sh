@@ -45,7 +45,7 @@ render_one() {
         echo "${out_path}"
         echo "render ball ${args_id} ${backend}"
         echo "exit"
-    } | ./RenderEngine 2>&1 | grep -E "Done|Rendering|Output|Error|error|failed|Failed"
+    } | ./Raypr3sso 2>&1 | grep -E "Done|Rendering|Output|Error|error|failed|Failed"
     
     if [ -f "${out_path}/render.png" ]; then
         echo "  ✓ Output: ${out_path}/render.png"

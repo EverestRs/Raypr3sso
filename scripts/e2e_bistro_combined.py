@@ -5,6 +5,7 @@ the street, idle-refine, and assert the outside frame is much brighter than
 the inside frame (combined scene: dim interior, daylight exterior)."""
 import base64, json, os, signal, socket, subprocess, sys, tempfile, time, urllib.request
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 import e2e_cdp_helper as cdp_check
 from e2e_cdp_helper import Cdp  # reuse Ws/Cdp (drag/wheel/screenshot/evaluate)
 
@@ -26,11 +27,11 @@ def stat(png):
 def main():
     server = subprocess.Popen(
         ["./build/render_server", "127.0.0.1", str(RENDER_PORT)],
-        cwd="/home/biwenbin/VSCodeProjects/RenderEngine",
+        cwd=REPO,
         env=dict(os.environ, RENDER_TOKEN=TOKEN),
         stdout=open(f"{OUT}/bistro_server.log", "wb"), stderr=subprocess.STDOUT)
     httpd = subprocess.Popen([sys.executable, "-m", "http.server", "8080"],
-                             cwd="/home/biwenbin/VSCodeProjects/RenderEngine",
+                             cwd=REPO,
                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     profile = os.path.join(OUT, "profile")
     subprocess.run(["rm", "-rf", profile])

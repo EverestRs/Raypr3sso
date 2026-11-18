@@ -3,6 +3,7 @@
 error card on dead server."""
 import json, os, subprocess, sys, tempfile, time, urllib.request
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 import e2e_cdp_helper as cdp_check
 from e2e_cdp_helper import Cdp
 cdp_check.CHROME_PORT = 9230
@@ -38,11 +39,11 @@ def key(cdp, k):
 
 def main():
     server = subprocess.Popen(["./build/render_server","127.0.0.1",str(RENDER_PORT)],
-        cwd="/home/biwenbin/VSCodeProjects/RenderEngine",
+        cwd=REPO,
         env=dict(os.environ, RENDER_TOKEN=TOKEN, RENDER_OIDN="1"),
         stdout=open(os.path.join(tempfile.gettempdir(), "p1_server.log"),"wb"), stderr=subprocess.STDOUT)
     httpd = subprocess.Popen([sys.executable,"-m","http.server","8080"],
-        cwd="/home/biwenbin/VSCodeProjects/RenderEngine",
+        cwd=REPO,
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     subprocess.run(["rm","-rf",os.path.join(tempfile.gettempdir(), "profile_p1")])
     chrome = subprocess.Popen(["google-chrome","--headless=new","--no-sandbox","--disable-gpu",

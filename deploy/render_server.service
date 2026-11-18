@@ -1,4 +1,4 @@
-# RenderEngine 远程渲染服务 systemd 单元（设计 12 生产环境）
+# Raypr3sso 远程渲染服务 systemd 单元（设计 12 生产环境）
 #
 # 安装：
 #   sudo cp deploy/render_server.service /etc/systemd/system/
@@ -9,7 +9,7 @@
 # 绑定：服务只监听 127.0.0.1，TLS 由反向代理（见 deploy/nginx-render.conf）负责。
 
 [Unit]
-Description=RenderEngine remote path-tracing service
+Description=Raypr3sso remote path-tracing service
 After=network-online.target
 Wants=network-online.target
 
@@ -17,14 +17,14 @@ Wants=network-online.target
 Type=simple
 User=render
 Group=render
-WorkingDirectory=/opt/renderengine
-ExecStart=/opt/renderengine/build/render_server 127.0.0.1 9000
+WorkingDirectory=/opt/raypr3sso
+ExecStart=/opt/raypr3sso/build/render_server 127.0.0.1 9000
 Restart=always
 RestartSec=3
 # 安全基线（设计 13）
 NoNewPrivileges=true
 ProtectSystem=strict
-ReadWritePaths=/opt/renderengine/output
+ReadWritePaths=/opt/raypr3sso/output
 PrivateTmp=true
 Environment=RENDER_SESSION_TTL=900
 Environment=RENDER_RENDER_TIMEOUT=600

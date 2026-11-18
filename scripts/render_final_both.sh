@@ -41,7 +41,7 @@ export RENDER_ADAPTIVE_CHECK=8
   echo "$OUT/final_wf"
   echo "render bext wf gpu"
   echo "exit"
-} | ./build/RenderEngine 2>&1 | tee $OUT/render_log.txt | grep -E "ADAPTSTAT|AOVSTAT|Adaptive|Wavefront|DENOISE|Done in|Output file|CUDA ERROR"
+} | ./build/Raypr3sso 2>&1 | tee $OUT/render_log.txt | grep -E "ADAPTSTAT|AOVSTAT|Adaptive|Wavefront|DENOISE|Done in|Output file|CUDA ERROR"
 
 echo "=== md5 ==="
 md5sum $OUT/final_mega/*.png $OUT/final_wf/*.png

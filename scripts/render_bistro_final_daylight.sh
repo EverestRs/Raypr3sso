@@ -60,7 +60,7 @@ export RENDER_ADAPTIVE_CHECK=8
   echo "$OUT"
   echo "render bext final gpu"
   echo "exit"
-} | ./build/RenderEngine 2>&1 | tee $OUT/render_log.txt | grep -E "ADAPTSTAT|AOVSTAT|Adaptive|DENOISE|Contrast|Done in|Output file|CUDA ERROR"
+} | ./build/Raypr3sso 2>&1 | tee $OUT/render_log.txt | grep -E "ADAPTSTAT|AOVSTAT|Adaptive|DENOISE|Contrast|Done in|Output file|CUDA ERROR"
 
 echo "=== compare with official ==="
 FINAL_PNG=$(ls -t $OUT/render_*.png | head -1)

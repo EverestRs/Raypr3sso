@@ -26,7 +26,7 @@ run_variant() { # $1=scale $2=horizon $3=htrans $4=name $5..=int list
         RENDER_SUN_AZ=-90 RENDER_SUN_EL=55 RENDER_SUN_TINT="1 0.95 0.88" \
         RENDER_TONEMAP=aces RENDER_DENOISE=1 RENDER_EMISSION_SCALE=0.008 \
         RENDER_SKY_FOCUS_DIM=0.999 RENDER_SKY_FOCUS_CONE=12 RENDER_WB_STRENGTH=0.2 \
-        ./build/RenderEngine 2>&1 | grep -E "AOVSTAT|Done in|Output file|CUDA ERROR"
+        ./build/Raypr3sso 2>&1 | grep -E "AOVSTAT|Done in|Output file|CUDA ERROR"
 }
 
 run_variant 0.7 0.35 0.6 m2 10 14

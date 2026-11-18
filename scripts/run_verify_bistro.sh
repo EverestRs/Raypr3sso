@@ -1,8 +1,8 @@
 #!/bin/bash
 # Reproduce the bistro GPU render to verify the overexposure + specular fixes.
-cd /home/biwenbin/VSCodeProjects/RenderEngine
+cd "$(dirname "$0")/.."
 
-BIN=./build/RenderEngine
+BIN=./build/Raypr3sso
 OUTDIR=output_gpu/render_bistro_verify
 
 mkdir -p "$OUTDIR"

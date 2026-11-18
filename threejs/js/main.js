@@ -375,7 +375,7 @@
 
     const title = document.createElement('div');
     title.className = 're-chip re-title';
-    title.innerHTML = 'RenderEngine <small>CUDA path tracing · remote progressive viewer</small>';
+    title.innerHTML = 'Raypr3sso <small>CUDA path tracing · remote progressive viewer</small>';
     document.body.appendChild(title);
 
     const hint = document.createElement('div');
@@ -438,7 +438,7 @@
         .then(b => {
           const a = document.createElement('a');
           a.href = URL.createObjectURL(b);
-          a.download = `renderengine_${submittedRenderId}.png`;
+          a.download = `raypr3sso_${submittedRenderId}.png`;
           document.body.appendChild(a); a.click(); a.remove();
           setTimeout(() => URL.revokeObjectURL(a.href), 5000);
         })

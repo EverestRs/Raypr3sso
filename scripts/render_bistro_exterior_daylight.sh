@@ -50,4 +50,4 @@ export RENDER_ADAPTIVE_CHECK=${RENDER_ADAPTIVE_CHECK:-8}
   echo "output_gpu/render_bistro_exterior_daylight"
   echo "render bext daylight gpu"
   echo "exit"
-} | ./build/RenderEngine
+} | ./build/Raypr3sso

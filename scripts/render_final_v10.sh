@@ -28,6 +28,6 @@ export RENDER_ADAPTIVE_THRESH=0.02 RENDER_ADAPTIVE_CHECK=8
   echo "1920"; echo "1061"; echo "2048"; echo "12"; echo "0.70"
   echo "-17 3.2 0.7"; echo "1 -0.11 -0.09"; echo "50"
   echo "$OUT"; echo "render bext final gpu"; echo "exit"
-} | ./build/RenderEngine 2>&1 | tee $OUT/render_log.txt | grep -E "ADAPTSTAT|AOVSTAT|SUNMASK|OIDN|AO:|DENOISE done|Done in|Output file|CUDA ERROR"
+} | ./build/Raypr3sso 2>&1 | tee $OUT/render_log.txt | grep -E "ADAPTSTAT|AOVSTAT|SUNMASK|OIDN|AO:|DENOISE done|Done in|Output file|CUDA ERROR"
 FINAL_PNG=$(ls -t $OUT/render_*.png | head -1)
 python3 scripts/compare_official.py reference/official_bistro_daylight.png "$FINAL_PNG" $OUT/side_by_side.png

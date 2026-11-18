@@ -12,8 +12,9 @@ sphere-test 场景（加载 ~1s）。等待一律轮询服务端 session 状态
   5. 太阳方位 → session sun 更新，累积重置后重新收敛到 128
   6. 暂停按钮 → idleFired 计数不再增长；恢复后重新精修
 """
-import json, os, subprocess, sys, tempfile, time, urllib.request
+import json, os, subprocess, sys, tempfile, time, urllib.error, urllib.request
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 import e2e_cdp_helper as cdp_check
 from e2e_cdp_helper import Cdp
 cdp_check.CHROME_PORT = 9227
@@ -35,7 +36,12 @@ def sess():
 def wait_settled(seq0, timeout=150):
     """等待：seq 超过 seq0（至少一帧新预览）且累积回到 128。"""
     for _ in range(timeout):
-        s = sess()
+        try:
+            s = sess()
+        except urllib.error.HTTPError:
+            # 页面尚未建立 session（启动竞态，GET s-1 返回 404）→ 继续等
+            time.sleep(1)
+            continue
         if s["previewSequence"] > seq0 and s["accumSamples"] >= 128:
             return s
         time.sleep(1)
@@ -43,12 +49,12 @@ def wait_settled(seq0, timeout=150):
 
 def main():
     server = subprocess.Popen(["./build/render_server", "127.0.0.1", str(RENDER_PORT)],
-        cwd="/home/biwenbin/VSCodeProjects/RenderEngine",
+        cwd=REPO,
         env=dict(os.environ, RENDER_TOKEN=TOKEN),
         stdout=open(os.path.join(tempfile.gettempdir(), "nc_server.log"), "wb"),
         stderr=subprocess.STDOUT)
     httpd = subprocess.Popen([sys.executable, "-m", "http.server", "8080"],
-        cwd="/home/biwenbin/VSCodeProjects/RenderEngine",
+        cwd=REPO,
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     subprocess.run(["rm", "-rf", "/tmp/wf_e2e/profile_nc"])
     chrome = subprocess.Popen(["google-chrome", "--headless=new", "--no-sandbox", "--disable-gpu",

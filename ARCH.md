@@ -3,7 +3,7 @@
 ## 1. 项目结构
 
 ```
-RenderEngine/
+Raypr3sso/
 ├── CMakeLists.txt                 # 主构建文件
 ├── external/                      # 第三方库
 │   ├── glm/                       # 数学库 (CPU)

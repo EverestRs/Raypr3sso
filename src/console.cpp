@@ -53,7 +53,7 @@ void Console::run() {
             }
 
         } else if (cmd == "help") {
-            std::cout << "RenderEngine v0.1.0 Commands:\n"
+            std::cout << "Raypr3sso v0.1.0 Commands:\n"
                       << "  create model <id> [folder model_name sky] - Cornell box, or load FBX\n"
                       << "  create model <id> ball [diffuse|rough|glass] - Single sphere test\n"
                       << "  create args <id>                         - Create render args\n"

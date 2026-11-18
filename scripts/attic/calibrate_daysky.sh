@@ -43,7 +43,7 @@ mkargs() { # $1=name $2=exp $3=out
   mkargs a4 0.7 v4_int18_wb015
   echo "render bext a4 gpu"
   echo "exit"
-} | ./build/RenderEngine 2>&1 | grep -E "AOVSTAT|Done in|Output file|Skybox|CUDA ERROR"
+} | ./build/Raypr3sso 2>&1 | grep -E "AOVSTAT|Done in|Output file|Skybox|CUDA ERROR"
 
 echo "=== compare ==="
 for d in $OUT/v*/; do

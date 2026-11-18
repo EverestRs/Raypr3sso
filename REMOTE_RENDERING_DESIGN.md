@@ -745,7 +745,7 @@ src/server/
 构建目标：
 
 ```text
-RenderEngine      # 保留现有 CLI
+Raypr3sso      # 保留现有 CLI
 render_server     # 远程服务进程
 ```
 

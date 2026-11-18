@@ -52,7 +52,7 @@ mkargs() { # $1=name $2=spp $3=outdir
   mkargs p5 64 mega_adapt
   echo "render bext p5 gpu"
   echo "exit"
-} | ./build/RenderEngine 2>&1 | tee $OUT/ab_log.txt | grep -E "ADAPTSTAT|AOVSTAT|Wavefront|Adaptive|Done in|Output file|renderGPU|CUDA ERROR|error"
+} | ./build/Raypr3sso 2>&1 | tee $OUT/ab_log.txt | grep -E "ADAPTSTAT|AOVSTAT|Wavefront|Adaptive|Done in|Output file|renderGPU|CUDA ERROR|error"
 
 echo "=== md5 ==="
 md5sum $OUT/*/*.png

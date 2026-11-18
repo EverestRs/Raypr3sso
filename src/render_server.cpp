@@ -1431,7 +1431,7 @@ std::string RenderServer::route(const std::string& method, const std::string& pa
     contentType = "application/json";
     if (method == "OPTIONS") return R"({"ok":true})";
     if (method == "GET" && path == "/api/health")
-        return R"({"ok":true,"service":"RenderEngine","gpuWorker":true})";
+        return R"({"ok":true,"service":"Raypr3sso","gpuWorker":true})";
     // 速率限制（设计 13）：创建 session / 更新相机 / 启动 render。
     if (method == "POST" && path == "/api/sessions" &&
         !rateLimiter_.allow("create-session", 10, 60)) {
