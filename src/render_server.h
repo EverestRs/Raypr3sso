@@ -106,6 +106,12 @@ private:
         float exposure = 1.0f;
         float warmTint = 1.0f;
         float saturationBoost = 1.0f;
+        // -1 = follow the RENDER_BLOOM env default (A1).
+        int bloom = -1;
+        // Directional sun override (A3): sunHas=false means "follow the
+        // RENDER_SUN_* env rig". sunInt=0 with sunHas=true = sun off.
+        bool sunHas = false;
+        float sunAz = 0.0f, sunEl = 45.0f, sunInt = 0.0f;
         // Indoor auto-exposure tier (from the preset, design 10.4): when the
         // camera is inside [indoorMin, indoorMax] the client blends the
         // per-render exposure up to indoorExposure (smoothstep over
@@ -124,6 +130,10 @@ private:
         uint64_t accumGeneration = 0;  // generation the accumulation belongs to
         int accumWidth = 0, accumHeight = 0;
         int accumNeeK = 0;             // NEE K the accumulation was built with (4.2)
+        // Sun the accumulation was built with (A3): sunHas=false = the env
+        // rig (the process env is fixed for the server's lifetime).
+        bool accumSunHas = false;
+        float accumSunAz = 0.0f, accumSunEl = 0.0f, accumSunInt = 0.0f;
         // Set by submitRender when the accumulation must restart; consumed
         // (and ONLY executed) by runRenderChunk on the GPU worker. The reset
         // itself calls cudaMemset on the context's buffers, so it must never
@@ -161,6 +171,10 @@ private:
         std::chrono::steady_clock::time_point startTime =
             std::chrono::steady_clock::now();
         bool timedOut = false;   // chain exceeded the render timeout (13)
+        // A4 encode pipeline: set once the encode thread stored this
+        // render's preview/final bytes. REST "completed" is gated on it so
+        // a poller never sees completed before GET /image can serve bytes.
+        bool encoded = false;
         RenderScheduler::Job job;
         std::vector<unsigned char> previewBytes;  // latest preview of this render (JPEG)
         std::vector<unsigned char> finalBytes;  // lossless PNG captured at chain end
@@ -193,13 +207,60 @@ private:
         uint32_t baseSeed = 0;
         // NEE samples per rough hit (设计 17); resolved (1..8) at submit.
         int neeK = 0;
+        // Directional sun (A3): copies of the session's effective sun at
+        // submit time; the worker applies applySunParams when sunHas.
+        bool sunHas = false;
+        float sunAz = 0.0f, sunEl = 0.0f, sunInt = 0.0f;
+        // Display-only re-encode (A2): the chain is already at budget and
+        // only display params changed — run a 0-sample finalize+encode
+        // instead of restarting the chain.
+        bool reencode = false;
         // 精修链的预览走 CLI 同源 NL-means 降噪器（拖动档保持原始快速帧）。
         bool denoise = false;
         // Display-only parameters for the preview encode (10.4).
         float exposure = 1.0f;
         float warmTint = 1.0f;
         float saturationBoost = 1.0f;
+        int bloom = -1;   // -1 = follow the RENDER_BLOOM env default
     };
+
+    // Self-contained preview-encode work item (encode pipeline): filled by
+    // the GPU worker at a chunk boundary and handed to the encode thread.
+    // Carries NO pointers into session/scene/context objects — those belong
+    // to the GPU worker and may be gone or mutated by the time the encode
+    // runs. encodePreview() is a pure function of this struct + server state.
+    struct EncodeJob {
+        std::string sessionId, renderId;
+        uint64_t generation = 0;
+        int width = 0, height = 0;
+        int spp = 0;              // chain sample budget (final-chunk flag)
+        int accumulatedSpp = 0;   // samples already folded into `output`
+        bool denoise = false;
+        bool progressive = false;
+        bool emitCompleted = false;  // final chunk: publish render-completed
+                                     // after the bytes are stored (so
+                                     // GET /image never races the event)
+        // Display-only parameters for the encode (10.4). bloom: -1 = follow
+        // the RENDER_BLOOM env default (the session field drives this).
+        float exposure = 1.0f;
+        float warmTint = 1.0f;
+        float saturationBoost = 1.0f;
+        int bloom = -1;
+        std::vector<PerPixelData> output;
+    };
+
+    // Encode pipeline: CPU preview encoding (postProcess + JPEG/PNG, 百
+    // 毫秒级 at refine resolutions) runs on its own thread so the GPU
+    // worker can start the next chunk immediately. Single thread + FIFO
+    // keeps per-session preview sequence order. Bounded queue: when full
+    // (or during shutdown) the GPU worker encodes synchronously — the old
+    // serialized behavior as backpressure.
+    static constexpr size_t kMaxEncodeQueue = 4;
+    std::mutex encodeMutex_;
+    std::condition_variable encodeCv_;
+    std::deque<EncodeJob> encodeQueue_;
+    bool encodeStopping_ = false;
+    std::thread encodeThread_;
 
     void handleClient(int clientSocket);
     std::string route(const std::string& method,
@@ -219,6 +280,11 @@ private:
                             int& status, std::string& contentType);
     bool handleWebSocket(int clientSocket, const std::string& request);
     void runRenderChunk(const ChunkTask& task, const RenderScheduler::Job& job);
+    // Hand a finished chunk's output to the encode thread (async), or encode
+    // synchronously when the queue is full / shutting down.
+    void enqueueEncode(EncodeJob&& job);
+    // Encode-thread main loop: drains the FIFO until shutdown.
+    void encodeLoop();
     // Fan an event JSON out to every live channel of one session (design 8:
     // the GPU worker is the only producer; HTTP threads only consume).
     void publishEvent(const std::string& sessionId, const std::string& event);
@@ -229,9 +295,10 @@ private:
     // threads). Marks the registry entry ready or failed when done.
     void loadSceneEntry(const std::string& modelId);
     // 阶段三 export point: tonemap + encode the current accumulation into
-    // the session's preview slot (PNG). Runs on the GPU worker after every
-    // productive chunk; reuses the CLI's exact postProcess pipeline (10.4).
-    void encodePreview(const ChunkTask& task, const std::vector<PerPixelData>& output);
+    // the session's preview slot. Runs on the ENCODE thread after every
+    // productive chunk (synchronously on the GPU worker only as queue-full
+    // backpressure); reuses the CLI's exact postProcess pipeline (10.4).
+    void encodePreview(const EncodeJob& job);
     // 设计 13 安全项：Origin 校验（回环/null/白名单）、token 比对辅助、
     // session 过期回收（GPU worker 上释放 CUDA 资源）、任务超时上限。
     bool originAllowed(const std::string& origin) const;

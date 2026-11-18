@@ -123,14 +123,12 @@ static int g_defaultNeeK = 4;
 void setNeeK(int k) { g_defaultNeeK = k > 0 ? k : 4; }
 int defaultNeeK() { return g_defaultNeeK; }
 
-bool applySunFromEnv(GPURenderArgs& args) {
-    // Directional sun (art-directed window light, RENDER_SUN_*).
+// Directional sun from explicit parameters (render server /render path):
+// direction from az/el, radiance = inten × RENDER_SUN_TINT, softness from
+// RENDER_SUN_SOFT. Shares the env path's tint/soft knobs so a request-level
+// override keeps the same look as the env-driven rig.
+bool applySunParams(GPURenderArgs& args, float az, float el, float inten) {
     // AZ: degrees from +x toward +z; EL: degrees above horizon.
-    const char* se = std::getenv("RENDER_SUN_INT");
-    if (!se || std::strtof(se, nullptr) <= 0.0f) return false;
-    float az = 0.0f, el = 45.0f, inten = std::strtof(se, nullptr);
-    if (const char* a = std::getenv("RENDER_SUN_AZ")) az = std::strtof(a, nullptr);
-    if (const char* e = std::getenv("RENDER_SUN_EL")) el = std::strtof(e, nullptr);
     const float azR = az * float(M_PI) / 180.0f, elR = el * float(M_PI) / 180.0f;
     const float3 dirRaw = make_float3(
         std::cos(elR) * std::cos(azR), std::sin(elR), std::cos(elR) * std::sin(azR));
@@ -164,6 +162,16 @@ bool applySunFromEnv(GPURenderArgs& args) {
         }
     }
     return true;
+}
+
+bool applySunFromEnv(GPURenderArgs& args) {
+    // Directional sun (art-directed window light, RENDER_SUN_*).
+    const char* se = std::getenv("RENDER_SUN_INT");
+    if (!se || std::strtof(se, nullptr) <= 0.0f) return false;
+    float az = 0.0f, el = 45.0f, inten = std::strtof(se, nullptr);
+    if (const char* a = std::getenv("RENDER_SUN_AZ")) az = std::strtof(a, nullptr);
+    if (const char* e = std::getenv("RENDER_SUN_EL")) el = std::strtof(e, nullptr);
+    return applySunParams(args, az, el, inten);
 }
 
 // Foliage shadow transmission (RENDER_LEAF_SHADOW_TINT, default 1.0):

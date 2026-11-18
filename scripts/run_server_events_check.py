@@ -172,11 +172,12 @@ def main():
         assert info["state"] == "completed" and info["sample"] == 64, info
         assert info["sampleBudget"] == 64 and info["sessionId"] == sid
         assert info["previewUrl"].startswith(f"/api/renders/{rid}/preview?seq=")
-        status, png = http("GET", f"/api/renders/{rid}/preview")
-        assert status == 200 and png[:8] == PNG_MAGIC and len(png) > 1000
+        # P1: per-chunk previews are JPEG (only /image is lossless PNG).
+        status, jpg = http("GET", f"/api/renders/{rid}/preview")
+        assert status == 200 and jpg[:3] == b"\xff\xd8\xff" and len(jpg) > 500
         status, img = http("GET", f"/api/renders/{rid}/image")
-        assert status == 200 and img[:8] == PNG_MAGIC and img == png
-        print(f"  status completed, preview {len(png)}B == image {len(img)}B OK")
+        assert status == 200 and img[:8] == PNG_MAGIC and len(img) > 1000
+        print(f"  status completed, preview {len(jpg)}B JPEG, image {len(img)}B PNG OK")
 
         print("--- cancel is idempotent on a completed render ---")
         status1, _ = http("POST", f"/api/renders/{rid}/cancel")

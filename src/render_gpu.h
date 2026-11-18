@@ -277,6 +277,10 @@ int defaultNeeK();
 // 一致——服务端此前从未设置 hasSun，Bistro 内景缺主直接光导致整体死黑）。
 // 返回是否启用了太阳。
 bool applySunFromEnv(GPURenderArgs& args);
+// 显式参数版（render server /render 的 sunAz/sunEl/sunInt）：方向来自
+// az/el，radiance = inten × RENDER_SUN_TINT，soft/cone-kill 仍跟随 env——
+// 与 env rig 同观感。inten<=0 时直接返回 false（关太阳）。
+bool applySunParams(GPURenderArgs& args, float az, float el, float inten);
 // Foliage shadow transmission knob (RENDER_LEAF_SHADOW_TINT, default 1.0)
 void setLeafShadowTint(float t);
 // Exact sRGB EOTF for baseColor textures (RENDER_SRGB_EXACT=1; default pow2.2)

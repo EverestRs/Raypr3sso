@@ -705,14 +705,16 @@ void renderGPUWavefrontCancelable(GPURenderArgs args, GPUModelData model,
     }
 
     // ---- Read back results (identical layout to the megakernel host) ----
-    std::vector<float4> colorBuf(pixelCount);
+    // gpuColor is NOT copied back: this host only fills `output`
+    // (PerPixelData) from the AOV buffers below and never reads the color
+    // channel — the ~8MB/chunk D2H at 960x540 was pure waste (the finalize
+    // kernel still writes the device buffer; CLI reads color elsewhere).
     std::vector<float4> ddBuf(pixelCount), dsBuf(pixelCount);
     std::vector<float4> idBuf(pixelCount), isBuf(pixelCount);
     std::vector<float4> emBuf(pixelCount);
     std::vector<float> varDdBuf(pixelCount), varDsBuf(pixelCount);
     std::vector<float> varIdBuf(pixelCount), varIsBuf(pixelCount);
 
-    cudaMemcpy(colorBuf.data(), gpuColor, pixelCount * sizeof(float4), cudaMemcpyDeviceToHost);
     cudaMemcpy(ddBuf.data(),    gpuDD,    pixelCount * sizeof(float4), cudaMemcpyDeviceToHost);
     cudaMemcpy(dsBuf.data(),    gpuDS,    pixelCount * sizeof(float4), cudaMemcpyDeviceToHost);
     cudaMemcpy(idBuf.data(),    gpuID,    pixelCount * sizeof(float4), cudaMemcpyDeviceToHost);

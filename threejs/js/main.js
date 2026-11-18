@@ -214,6 +214,29 @@
     // 视为初始手动值并关闭自动档
     let manualExp = exposure > 0 ? exposure : 0;
     let autoOn = !(exposure > 0);
+    // ---- B1 相机：FOV 与景深（?fov= &coc=；coc>0 即开启 DOF，对焦距离
+    // 每次提交自动取轨道目标距离）----
+    const urlFov = Math.min(140, Math.max(10, parseFloat(params.get('fov')) || 0));
+    let fovTouched = urlFov > 0;   // 用户是否改过 FOV（URL 写回与 preset 覆盖用）
+    let dofCoc = Math.min(6, Math.max(0.5, parseFloat(params.get('coc')) || 0)) || 0;
+    // ---- B2 画面（display-only，服务端不重置累积）：?sat= &tint= &bloom= ----
+    // *Touched=false / bloom=-1 = 未设置（跟随 session preset 默认）
+    let satTouched = params.has('sat');
+    let dispSat = Math.min(2, Math.max(0, parseFloat(params.get('sat')) || 1));
+    let tintTouched = params.has('tint');
+    let dispTint = Math.min(2, Math.max(0.5, parseFloat(params.get('tint')) || 1));
+    let dispBloom = params.has('bloom') ? (params.get('bloom') === '1' ? 1 : 0) : -1;
+    // ---- B3 太阳（radiance 变化，服务端重置累积重染）：?sun=az,el,int ----
+    let sun = null;
+    if (params.get('sun')) {
+      const s = params.get('sun').split(',').map(Number);
+      if (s.length === 3 && s.every(v => isFinite(v)))
+        sun = { az: Math.max(0, Math.min(360, s[0])),
+                el: Math.max(0, Math.min(90, s[1])),
+                int: Math.max(0, Math.min(100, s[2])) };
+    }
+    // ---- B4 暂停精修：停手后不再自动触发精修链 ----
+    let refinePaused = false;
     function tierExposure(pos) {
       if (!autoOn && manualExp > 0) return manualExp;    // 运行时手动（滑条）
       if (exposure > 0) return exposure;                 // URL 手动覆盖
@@ -243,6 +266,7 @@
     let submittedRenderId = null;
     let shownRenderId = null;
     let shownSequence = 0;
+    let overlayObjUrl = null;   // B5：当前 overlay 的 blob: URL（换帧时 revoke）
     // P1 统计面板数据源：有效 spp / chunk 间隔（预览事件到达间隔中位数）
     let lastSample = 0, lastBudget = 0, lastPrevT = 0;
     const cadence = [];
@@ -296,7 +320,11 @@
       .re-panel { position:fixed; top:52px; right:12px; z-index:11; width:228px;
         padding:10px 12px 12px; border-radius:6px; background:rgba(5,7,12,.85);
         border:1px solid rgba(148,163,184,.25); color:#e2e8f0;
-        font:12px system-ui,sans-serif; }
+        font:12px system-ui,sans-serif; max-height:calc(100vh - 70px);
+        overflow-y:auto; }
+      .re-panel::-webkit-scrollbar { width:6px; }
+      .re-panel::-webkit-scrollbar-thumb { background:rgba(148,163,184,.4);
+        border-radius:3px; }
       .re-panel h4 { margin:2px 0 7px; font-size:11px; color:#94a3b8;
         font-weight:600; letter-spacing:.05em; text-transform:uppercase; }
       .re-q { display:flex; gap:4px; flex-wrap:wrap; }
@@ -375,12 +403,15 @@
       if (/loading|connecting|unavailable/.test(text)) setBar(null);
     }
 
-    // ---- 控制面板（P0：保存帧 / 回位 / 质量档 / 曝光 / 全屏）----
+    // ---- 控制面板（P0：保存帧 / 回位 / 质量档 / 曝光 / 全屏；B1-B4：相机 /
+    // 画面 / 太阳 / 暂停精修）----
     const SVG = {
       settings: '<svg viewBox="0 0 24 24"><line x1="4" y1="6" x2="20" y2="6"/><circle cx="14" cy="6" r="2.2"/><line x1="4" y1="12" x2="20" y2="12"/><circle cx="8" cy="12" r="2.2"/><line x1="4" y1="18" x2="20" y2="18"/><circle cx="16" cy="18" r="2.2"/></svg>',
       save: '<svg viewBox="0 0 24 24"><path d="M12 4v10m0 0l-4-4m4 4l4-4M5 19h14"/></svg>',
       home: '<svg viewBox="0 0 24 24"><path d="M4 11l8-7 8 7M6 10v9h12v-9"/></svg>',
-      full: '<svg viewBox="0 0 24 24"><path d="M4 9V4h5M15 4h5v5M20 15v5h-5M9 20H4v-5"/></svg>'
+      full: '<svg viewBox="0 0 24 24"><path d="M4 9V4h5M15 4h5v5M20 15v5h-5M9 20H4v-5"/></svg>',
+      pause: '<svg viewBox="0 0 24 24"><path d="M9 5v14M15 5v14"/></svg>',
+      play: '<svg viewBox="0 0 24 24"><path d="M8 5l11 7-11 7z"/></svg>'
     };
     const ctl = document.createElement('div');
     ctl.className = 're-ctl';
@@ -481,12 +512,33 @@
     mkBtn('full', SVG.full, '全屏 (F)', toggleFullscreen);
     document.body.appendChild(ctl);
 
-    // 设置面板内容
+    // 设置面板内容。注意：曝光滑条必须是面板里第一个 input[type=range]
+    // （E2E 脚本以 .re-panel input[type=range] 定位它）。
+    const rowHtml = (label, input, valId) =>
+      `<div class="re-row"><span>${label}</span>${input}` +
+      (valId ? `<span class="re-ev" id="${valId}"></span>` : '') + `</div>`;
+    const rangeHtml = (id, min, max, step, val) =>
+      `<input type="range" id="${id}" min="${min}" max="${max}" step="${step}" value="${val}">`;
     panel.innerHTML = '<h4>精修分辨率</h4><div class="re-q"></div>'
-      + `<div class="re-row"><span>曝光</span>`
-      + `<input type="range" min="0.5" max="8" step="0.1" value="${(exposure > 0 ? exposure : 2.5).toFixed(1)}">`
-      + `<span class="re-ev">${(exposure > 0 ? exposure : 2.5).toFixed(1)}</span>`
-      + `<label title="室内自动提亮档按相机位置混合；手动时用滑条值"><input type="checkbox" ${exposure > 0 ? '' : 'checked'}>自动</label></div>`;
+      + rowHtml('曝光',
+          rangeHtml('re-in-exp', 0.5, 8, 0.1, (exposure > 0 ? exposure : 2.5).toFixed(1)),
+          're-v-exp')
+      + `<div class="re-row"><label title="室内自动提亮档按相机位置混合；手动时用滑条值">`
+        + `<input type="checkbox" id="re-in-expauto" ${exposure > 0 ? '' : 'checked'}>自动</label></div>`
+      + '<h4>画面</h4>'
+      + `<div class="re-row"><label title="亮部溢光（display-only，即时生效）">`
+        + `<input type="checkbox" id="re-in-bloom">Bloom 溢光</label></div>`
+      + rowHtml('饱和', rangeHtml('re-in-sat', 0, 2, 0.05, dispSat > 0 ? dispSat : 1), 're-v-sat')
+      + rowHtml('暖色', rangeHtml('re-in-tint', 0.5, 2, 0.05, dispTint > 0 ? dispTint : 1), 're-v-tint')
+      + '<h4>相机</h4>'
+      + rowHtml('FOV', rangeHtml('re-in-fov', 20, 100, 1, 45), 're-v-fov')
+      + `<div class="re-row"><label title="景深：对焦距离自动取观察目标，光圈控制虚化强度">`
+        + `<input type="checkbox" id="re-in-dof">景深</label></div>`
+      + rowHtml('光圈', rangeHtml('re-in-coc', 0.5, 6, 0.1, dofCoc > 0 ? dofCoc : 2), 're-v-coc')
+      + '<h4>太阳</h4>'
+      + rowHtml('方位', rangeHtml('re-in-sunaz', 0, 360, 1, sun ? sun.az : 90), 're-v-sunaz')
+      + rowHtml('高度', rangeHtml('re-in-sunel', 0, 90, 1, sun ? sun.el : 12), 're-v-sunel')
+      + rowHtml('强度', rangeHtml('re-in-sunint', 0, 100, 1, sun ? sun.int : 85), 're-v-sunint');
     document.body.appendChild(panel);
     const qRow = panel.querySelector('.re-q');
     QUALITIES.forEach((q, j) => {
@@ -496,9 +548,10 @@
       b.addEventListener('click', () => setQuality(j));
       qRow.appendChild(b);
     });
-    const expSlider = panel.querySelector('input[type=range]');
-    const expLabel = panel.querySelector('.re-ev');
-    const expAuto = panel.querySelector('input[type=checkbox]');
+    const expSlider = document.getElementById('re-in-exp');
+    const expLabel = document.getElementById('re-v-exp');
+    const expAuto = document.getElementById('re-in-expauto');
+    expLabel.textContent = (exposure > 0 ? exposure : 2.5).toFixed(1);
     let expTimer = null;
     expSlider.addEventListener('input', () => {
       autoOn = false;                       // 拖滑条 = 切手动
@@ -518,6 +571,113 @@
         submitRender(IDLE);                 // 回到自动档（室内提亮恢复）
       }
       syncUrl();
+    });
+
+    // ---- B1 相机：FOV / 景深 ----
+    // FOV 拖动中走拖动档（即时预览），释放后精修——与视角拖动同一条路径。
+    const fovSlider = document.getElementById('re-in-fov');
+    const fovVal = document.getElementById('re-v-fov');
+    fovVal.textContent = fovSlider.value + '°';
+    fovSlider.addEventListener('input', () => {
+      fovTouched = true;
+      camera.fov = parseFloat(fovSlider.value);
+      camera.updateProjectionMatrix();
+      fovVal.textContent = fovSlider.value + '°';
+      if (serverReady) scheduleDrag();
+    });
+    fovSlider.addEventListener('change', () => { syncUrl(); if (serverReady) scheduleIdle(); });
+    const dofBox = document.getElementById('re-in-dof');
+    const cocSlider = document.getElementById('re-in-coc');
+    const cocVal = document.getElementById('re-v-coc');
+    const syncDofUi = () => {
+      dofBox.checked = dofCoc > 0;
+      cocSlider.disabled = dofCoc <= 0;
+      cocVal.textContent = (dofCoc > 0 ? parseFloat(cocSlider.value) : 0).toFixed(1);
+    };
+    syncDofUi();
+    dofBox.addEventListener('change', () => {
+      dofCoc = dofBox.checked ? parseFloat(cocSlider.value) : 0;
+      syncDofUi(); syncUrl();
+      if (serverReady) { scheduleDrag(); scheduleIdle(); }
+    });
+    cocSlider.addEventListener('input', () => {
+      if (dofBox.checked) { dofCoc = parseFloat(cocSlider.value); cocVal.textContent = dofCoc.toFixed(1); }
+      if (serverReady) scheduleDrag();
+    });
+    cocSlider.addEventListener('change', () => { syncUrl(); if (serverReady) scheduleIdle(); });
+
+    // ---- B2 画面（display-only：不重置累积，链完成后服务端 0-sample 再编码）----
+    let dispTimer = null;
+    function submitDisplay() {
+      if (dispTimer) clearTimeout(dispTimer);
+      dispTimer = setTimeout(() => {
+        dispTimer = null;
+        if (serverReady) submitRender(IDLE, { noCamera: true });
+      }, 250);
+    }
+    const bloomBox = document.getElementById('re-in-bloom');
+    const satSlider = document.getElementById('re-in-sat');
+    const tintSlider = document.getElementById('re-in-tint');
+    const satVal = document.getElementById('re-v-sat');
+    const tintVal = document.getElementById('re-v-tint');
+    satVal.textContent = (dispSat > 0 ? dispSat : 1).toFixed(2);
+    tintVal.textContent = (dispTint > 0 ? dispTint : 1).toFixed(2);
+    bloomBox.checked = dispBloom === 1;
+    bloomBox.addEventListener('change', () => {
+      dispBloom = bloomBox.checked ? 1 : 0;
+      syncUrl(); submitDisplay();
+    });
+    satSlider.addEventListener('input', () => {
+      satTouched = true;
+      dispSat = parseFloat(satSlider.value);
+      satVal.textContent = dispSat.toFixed(2);
+      submitDisplay();
+    });
+    tintSlider.addEventListener('input', () => {
+      tintTouched = true;
+      dispTint = parseFloat(tintSlider.value);
+      tintVal.textContent = dispTint.toFixed(2);
+      submitDisplay();
+    });
+
+    // ---- B3 太阳（radiance 变化：释放才提交，服务端重置累积重染）----
+    const sunAzSl = document.getElementById('re-in-sunaz');
+    const sunElSl = document.getElementById('re-in-sunel');
+    const sunIntSl = document.getElementById('re-in-sunint');
+    const sunAzV = document.getElementById('re-v-sunaz');
+    const sunElV = document.getElementById('re-v-sunel');
+    const sunIntV = document.getElementById('re-v-sunint');
+    const readSun = () => {
+      sun = { az: parseFloat(sunAzSl.value), el: parseFloat(sunElSl.value),
+              int: parseFloat(sunIntSl.value) };
+      sunAzV.textContent = sun.az.toFixed(0) + '°';
+      sunElV.textContent = sun.el.toFixed(0) + '°';
+      sunIntV.textContent = sun.int.toFixed(0);
+    };
+    readSun();
+    [sunAzSl, sunElSl, sunIntSl].forEach(sl => {
+      sl.addEventListener('input', readSun);
+      sl.addEventListener('change', () => {   // 释放即重染
+        syncUrl();
+        if (serverReady) submitRender(IDLE, { noCamera: true });
+      });
+    });
+
+    // ---- B4 暂停/继续精修 ----
+    const pauseBtn = mkBtn('pause', SVG.pause, '暂停/继续精修 (P)', () => {
+      refinePaused = !refinePaused;
+      pauseBtn.innerHTML = refinePaused ? SVG.play : SVG.pause;
+      pauseBtn.title = refinePaused ? '继续精修 (P)' : '暂停精修 (P)';
+      if (refinePaused) {
+        // 取消在跑链；显示中的帧保留
+        if (submittedRenderId)
+          fetch(endpoint(authPath(`/api/renders/${submittedRenderId}/cancel`)),
+                { method: 'POST' }).catch(() => {});
+        show(model + ' 精修已暂停');
+      } else {
+        show(model + ' 继续精修');
+        scheduleIdle();
+      }
     });
 
     // ---- P1-6 实时统计面板（与设置面板互斥，同位右侧）----
@@ -660,6 +820,16 @@
       params.set('idleRes', `${IDLE.width}x${IDLE.height}`);
       if (!autoOn && manualExp > 0) params.set('exposure', manualExp);
       else params.delete('exposure');
+      // B1/B2/B3：相机、画面与太阳设置（画面为 display-only，太阳重染）
+      if (fovTouched) params.set('fov', Math.round(camera.fov));
+      else params.delete('fov');
+      if (dofCoc > 0) params.set('coc', dofCoc.toFixed(1)); else params.delete('coc');
+      if (satTouched) params.set('sat', dispSat); else params.delete('sat');
+      if (tintTouched) params.set('tint', dispTint); else params.delete('tint');
+      if (dispBloom >= 0) params.set('bloom', dispBloom ? '1' : '0'); else params.delete('bloom');
+      if (sun && (sun.az !== 90 || sun.el !== 12 || sun.int !== 85))
+        params.set('sun', `${Math.round(sun.az)},${Math.round(sun.el)},${Math.round(sun.int)}`);
+      else params.delete('sun');
       history.replaceState(null, '', `${location.pathname}?${params}`);
     }
 
@@ -685,6 +855,7 @@
       if (k === 'f') toggleFullscreen();
       else if (k === 'r') goHome();
       else if (k === 'h') document.body.classList.toggle('re-hideui');
+      else if (k === 'p') document.getElementById('re-btn-pause').click();
       else if (k >= '1' && k <= '4') setQuality(parseInt(k, 10) - 1);
     });
     // 触控适配：粗指针下芯片放大、提示换触控文案
@@ -724,8 +895,10 @@
         direction: [direction.x, direction.y, direction.z],
         up: [camera.up.x, camera.up.y, camera.up.z],
         fov: camera.fov,
-        focus: 0,
-        coc: 0
+        // B1 景深：对焦距离自动取轨道目标距离（所见即所得），coc 是光圈
+        // 强度（px）；dofCoc=0 关闭（服务端 focus/coc 协议早已支持）
+        focus: dofCoc > 0 ? camera.position.distanceTo(controls.target) : 0,
+        coc: dofCoc
       };
     }
 
@@ -738,17 +911,32 @@
     let interacting = false;
 
     let lastSubmitOk = false;
-    function submitRender(tier) {
+    // opts.noCamera：display-only / 太阳变更的重提交不带相机（服务端相机
+    // 未变化本来也不会 bump generation，显式省略更干净）。
+    function submitRender(tier, opts) {
+      opts = opts || {};
+      if (refinePaused && opts.noCamera) return;   // 暂停时不再自动精修
       if (!serverReady) return;   // P1：断线/场景切换期间不提交（防杂散请求）
       if (postInFlight) { dbg.skippedInFlight++; dirty = true; return; }
       dbg.submits++;
       postInFlight = true;
       // 批1：camera 并入 render 请求体（一次 RTT），服务端 applyCamera 语义
       // 与 POST /camera 相同（generation++、取消在跑链）。
-      const payload = Object.assign({ cameraGeneration: generation,
-                                      camera: cameraPayload() }, tier);
+      const payload = Object.assign({}, tier);
+      if (!opts.noCamera) {
+        payload.cameraGeneration = generation;
+        payload.camera = cameraPayload();
+      }
       const e = tierExposure(camera.position);
       if (e > 0) payload.exposure = e;
+      // B2/B3：画面与太阳参数随每次提交幂等携带——服务端 display-only 不
+      // 重置累积，太阳值不变也不重置；断线/切场景后自动恢复生效。
+      if (satTouched) payload.saturationBoost = dispSat;
+      if (tintTouched) payload.warmTint = dispTint;
+      if (dispBloom >= 0) payload.bloom = dispBloom;
+      if (sun) {
+        payload.sunAz = sun.az; payload.sunEl = sun.el; payload.sunInt = sun.int;
+      }
       dbg.lastExposure = e;
       // 自动档下滑条跟随当前有效曝光（手动时用户在拖，不打扰）
       if (autoOn) {
@@ -801,6 +989,7 @@
       if (idleTimer) clearTimeout(idleTimer);
       idleTimer = setTimeout(() => {
         idleTimer = null;
+        if (refinePaused) { idleRetries = 0; return; }   // B4：暂停精修
         if (interacting) { idleRetries = 0; return; }
         if (postInFlight) {
           if (++idleRetries > IDLE_RETRY_MAX) { idleRetries = 0; return; }
@@ -843,6 +1032,27 @@
           .then((response) => response.json())
           .then((info) => {
             applySessionCamera(info);          // 同步轨道 + 缓存标定机位（R 回位用）
+            // B1：FOV 默认跟随 session preset；?fov= / 用户改过则覆盖
+            if (fovTouched) {
+              camera.fov = urlFov;
+              camera.updateProjectionMatrix();
+            }
+            fovSlider.value = Math.round(camera.fov);
+            fovVal.textContent = Math.round(camera.fov) + '°';
+            // B2/B3：画面与太阳初值从 session 同步（仅当 URL 未覆盖）
+            if (!satTouched && info.saturationBoost > 0) {
+              satSlider.value = info.saturationBoost;
+              satVal.textContent = info.saturationBoost.toFixed(2);
+            }
+            if (!tintTouched && info.warmTint > 0) {
+              tintSlider.value = info.warmTint;
+              tintVal.textContent = info.warmTint.toFixed(2);
+            }
+            if (!sun && info.sun && info.sun.has) {
+              sunAzSl.value = info.sun.az; sunElSl.value = info.sun.el;
+              sunIntSl.value = info.sun.int;
+              readSun();
+            }
             // 室内自动提亮档参数（server 从 preset 下发；indoorExposure 0 = 无）
             autoExposure = {
               base: info.exposure || 1.0,
@@ -890,27 +1100,40 @@
         lastSample = msg.sample; lastBudget = msg.sampleBudget;
         sampleHist.push(msg.sample); if (sampleHist.length > 8) sampleHist.shift();
         if (!chainFirstUrl) { chainFirstUrl = new URL(authPath(msg.previewUrl), base).toString(); chainFirstSample = msg.sample; }
-        // 批1：预解码后再上屏（img.decode）——高频 JPEG 换帧不再出现
-        // 半解码闪烁；晚到的旧解码被 sequence 检查丢弃。
+        // B5：fetch→blob→objectURL 单次取图解码（此前 probe+overlay 对同一
+        // URL 取图/解码两次）；解码完成后再上屏，晚到的旧帧按 sequence 丢弃。
         const url = new URL(authPath(msg.previewUrl), base).toString();
         const seq = msg.sequence, rid = msg.renderId;
-        const probe = new Image();
-        probe.onload = () => {
-          if (rid === submittedRenderId && seq <= shownSequence) return;
-          overlay.src = url;
-          overlay.hidden = false;
-          shownRenderId = rid;
-          shownSequence = seq;
-          applyBlur(msg.sample, msg.sampleBudget);
-          setBar(msg.sampleBudget > 0 ? msg.sample / msg.sampleBudget : null);
-          const eta = etaSeconds();
-          show(model + ' spp ' + msg.sample + '/' + msg.sampleBudget +
-               (eta > 0 ? ' · ~' + Math.max(1, Math.round(eta)) + 's' : ''));
-          updateStats();
-          if (abOn) abTagB.textContent = '当前 ' + msg.sample + ' spp';
-        };
-        probe.onerror = () => {};
-        probe.src = url;
+        fetch(url)
+          .then((r) => { if (!r.ok) throw new Error(r.status); return r.blob(); })
+          .then((blob) => {
+            if (rid !== submittedRenderId ||
+                (rid === shownRenderId && seq <= shownSequence)) return;
+            const objUrl = URL.createObjectURL(blob);
+            const probe = new Image();
+            probe.onload = () => {
+              if (rid !== submittedRenderId || seq <= shownSequence) {
+                URL.revokeObjectURL(objUrl);
+                return;
+              }
+              if (overlayObjUrl) URL.revokeObjectURL(overlayObjUrl);
+              overlayObjUrl = objUrl;
+              overlay.src = objUrl;
+              overlay.hidden = false;
+              shownRenderId = rid;
+              shownSequence = seq;
+              applyBlur(msg.sample, msg.sampleBudget);
+              setBar(msg.sampleBudget > 0 ? msg.sample / msg.sampleBudget : null);
+              const eta = etaSeconds();
+              show(model + ' spp ' + msg.sample + '/' + msg.sampleBudget +
+                   (eta > 0 ? ' · ~' + Math.max(1, Math.round(eta)) + 's' : ''));
+              updateStats();
+              if (abOn) abTagB.textContent = '当前 ' + msg.sample + ' spp';
+            };
+            probe.onerror = () => URL.revokeObjectURL(objUrl);
+            probe.src = objUrl;
+          })
+          .catch(() => {});
         return;
       }
       if (msg.type === 'render-completed') {

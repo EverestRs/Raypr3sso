@@ -282,6 +282,7 @@ RenderServer::RenderServer(std::string bindAddress, uint16_t port, std::string t
     if (const char* ttl = std::getenv("RENDER_SESSION_TTL"))
         sessionTtlSeconds_ = std::max(5.0, std::strtod(ttl, nullptr));
     s_self = this;   // singleton in practice; the progress sink publishes through it
+    encodeThread_ = std::thread([this] { encodeLoop(); });
 }
 
 RenderServer::~RenderServer() {
@@ -297,6 +298,15 @@ void RenderServer::stop() {
         listenSocket_ = -1;
     }
     scheduler_.shutdown();
+    // Encode thread last: it depends on nothing above, but drains queued
+    // previews (incl. a final PNG) before exiting so a shutdown mid-chain
+    // still lands its bytes.
+    {
+        std::lock_guard<std::mutex> lock(encodeMutex_);
+        encodeStopping_ = true;
+    }
+    encodeCv_.notify_all();
+    if (encodeThread_.joinable()) encodeThread_.join();
 }
 
 std::string RenderServer::createSession(const std::string& body, int& status) {
@@ -646,9 +656,18 @@ std::string RenderServer::sessionStatus(const std::string& id, int& status) {
          << "],\"direction\":[" << session.camera.direction.x << ','
          << session.camera.direction.y << ',' << session.camera.direction.z
          << "],\"up\":[" << session.camera.up.x << ',' << session.camera.up.y
-         << ',' << session.camera.up.z << "],\"fov\":" << session.camera.fov << "}"
+         << ',' << session.camera.up.z << "],\"fov\":" << session.camera.fov
+         << ",\"focus\":" << session.camera.focus
+         << ",\"coc\":" << session.camera.coc << "}"
          << ",\"state\":\"" << state << "\""
          << ",\"exposure\":" << session.exposure
+         << ",\"warmTint\":" << session.warmTint
+         << ",\"saturationBoost\":" << session.saturationBoost
+         << ",\"bloom\":" << session.bloom
+         << ",\"sun\":{\"has\":" << (session.sunHas ? "true" : "false")
+         << ",\"az\":" << session.sunAz
+         << ",\"el\":" << session.sunEl
+         << ",\"int\":" << session.sunInt << "}"
          << ",\"accumSamples\":" << session.wavefront->nextSample()
          << ",\"accumGeneration\":" << session.accumGeneration
          << ",\"previewSequence\":" << session.previewSequence
@@ -744,6 +763,31 @@ std::string RenderServer::submitRender(const std::string& id, const std::string&
         adaptiveCheck = std::min(1024, std::max(2, int(value)));
     if (jsonNumber(body, "adaptiveThresh", value))
         adaptiveThresh = std::min(1.0f, std::max(1e-4f, value));
+    // Display-only params (A1, 10.4): absent/0 = keep the session's value.
+    // Changing any of these NEVER resets the accumulation — they are applied
+    // at preview-encode time only.
+    float warmTint = 0.0f;
+    if (jsonNumber(body, "warmTint", value) && value > 0.0f && std::isfinite(value))
+        warmTint = std::min(4.0f, std::max(0.25f, value));
+    float saturationBoost = 0.0f;
+    if (jsonNumber(body, "saturationBoost", value) && value >= 0.0f && std::isfinite(value))
+        saturationBoost = std::min(4.0f, value);
+    int bloom = -1;
+    if (jsonNumber(body, "bloom", value)) bloom = value != 0.0f ? 1 : 0;
+    // Directional sun override (A3): any of the three keys arms the session
+    // override (each key merges over the previous values). sunInt=0 = sun
+    // off. Radiance-affecting: a change resets the accumulation (4.2).
+    bool sunAzSet = false, sunElSet = false, sunIntSet = false;
+    float sunAz = 0.0f, sunEl = 0.0f, sunInt = 0.0f;
+    if (jsonNumber(body, "sunAz", value) && std::isfinite(value)) {
+        sunAz = value; sunAzSet = true;
+    }
+    if (jsonNumber(body, "sunEl", value) && std::isfinite(value)) {
+        sunEl = value; sunElSet = true;
+    }
+    if (jsonNumber(body, "sunInt", value) && std::isfinite(value)) {
+        sunInt = value; sunIntSet = true;
+    }
     // Merged camera (批1): an optional "camera" object in the render body
     // replaces the separate POST /camera round trip — one RTT per submit.
     // The JSON helpers are substring-based, so the nested camera fields
@@ -800,15 +844,57 @@ std::string RenderServer::submitRender(const std::string& id, const std::string&
                               session.activeJob->state() == RenderJobState::queued))
         cancelIfActive(session.activeJob);
     // Merged camera (批1): apply before the generation read, exactly like
-    // POST /camera does — one RTT per submit instead of two.
+    // POST /camera does — one RTT per submit instead of two. An IDENTICAL
+    // camera (position/basis/fov/focus/coc within epsilon) does NOT bump
+    // the generation: display-only re-submits (exposure/bloom/… tweaks)
+    // must keep the accumulation (10.4) — previously any /render carrying a
+    // camera restarted from sample 0 and threw away the refinement.
     if (hasCamera) {
-        session.camera = cam;
-        session.camera.direction = glm::normalize(cam.direction);
-        session.camera.up = glm::normalize(cam.up);
-        ++session.generation;
+        const glm::vec3 nd = glm::normalize(cam.direction);
+        const glm::vec3 nu = glm::normalize(cam.up);
+        const Camera& cur = session.camera;
+        const bool cameraMoved =
+            glm::length(cam.position - cur.position) > 1e-4f ||
+            glm::length(nd - cur.direction) > 1e-4f ||
+            glm::length(nu - cur.up) > 1e-4f ||
+            std::abs(cam.fov - cur.fov) > 1e-3f ||
+            std::abs(cam.focus - cur.focus) > 1e-3f ||
+            std::abs(cam.coc - cur.coc) > 1e-3f;
+        if (cameraMoved) {
+            session.camera = cam;
+            session.camera.direction = nd;
+            session.camera.up = nu;
+            ++session.generation;
+        }
     }
-    // Exposure is display-only (10.4): it never resets the accumulation.
+    // Display-only params (10.4/A1): applied at encode time, never reset.
+    const bool displayChanged =
+        (exposure > 0.0f && std::abs(exposure - session.exposure) > 1e-4f) ||
+        (warmTint > 0.0f && std::abs(warmTint - session.warmTint) > 1e-4f) ||
+        (saturationBoost > 0.0f &&
+         std::abs(saturationBoost - session.saturationBoost) > 1e-4f) ||
+        (bloom >= 0 && bloom != session.bloom);
     if (exposure > 0.0f) session.exposure = exposure;
+    if (warmTint > 0.0f) session.warmTint = warmTint;
+    if (saturationBoost > 0.0f) session.saturationBoost = saturationBoost;
+    if (bloom >= 0) session.bloom = bloom;
+    // Sun override merge (A3): compare before storing to detect changes.
+    bool sunChanged = false;
+    if (sunAzSet || sunElSet || sunIntSet) {
+        const bool hadSun = session.sunHas;
+        const float oAz = session.sunAz, oEl = session.sunEl, oInt = session.sunInt;
+        if (sunAzSet)
+            session.sunAz = std::fmod(std::fmod(sunAz, 360.0f) + 360.0f, 360.0f);
+        if (sunElSet)
+            session.sunEl = std::min(90.0f, std::max(-90.0f, sunEl));
+        if (sunIntSet)
+            session.sunInt = std::min(200.0f, std::max(0.0f, sunInt));
+        sunChanged = !hadSun ||
+                     std::abs(session.sunAz - oAz) > 1e-3f ||
+                     std::abs(session.sunEl - oEl) > 1e-3f ||
+                     std::abs(session.sunInt - oInt) > 1e-3f;
+        session.sunHas = true;
+    }
 
     // Reset accumulation when anything radiance-affecting changed
     // (generation, resolution) or the caller asked for it (design 4.2/5.2).
@@ -834,16 +920,33 @@ std::string RenderServer::submitRender(const std::string& id, const std::string&
         if (!evicted) break;
     }
     // NEE K 属于"每 sample 积分器质量参数"（设计 4.2）：变化即重置累积。
+    // 太阳同理（A3，radiance-affecting）。
     const int effectiveNeeK = neeK > 0 ? neeK : defaultNeeK();
+    const bool sunDiffers = session.sunHas != session.accumSunHas ||
+        (session.sunHas &&
+         (std::abs(session.sunAz - session.accumSunAz) > 1e-3f ||
+          std::abs(session.sunEl - session.accumSunEl) > 1e-3f ||
+          std::abs(session.sunInt - session.accumSunInt) > 1e-3f));
+    bool resetArmed = false;
     if (resetAccumulation || generation != session.accumGeneration ||
         width != session.accumWidth || height != session.accumHeight ||
-        effectiveNeeK != session.accumNeeK) {
+        effectiveNeeK != session.accumNeeK || sunChanged || sunDiffers) {
         session.pendingReset = true;
         session.accumGeneration = generation;
         session.accumWidth = width;
         session.accumHeight = height;
         session.accumNeeK = effectiveNeeK;
+        session.accumSunHas = session.sunHas;
+        session.accumSunAz = session.sunAz;
+        session.accumSunEl = session.sunEl;
+        session.accumSunInt = session.sunInt;
+        resetArmed = true;
     }
+    // A2: display-only change with the accumulation intact — if the chain
+    // already reached its budget, the worker runs one 0-sample re-encode
+    // instead of restarting (a still-running chain just encodes the next
+    // chunk with the new display params).
+    const bool reencode = displayChanged && !resetArmed;
 
     // Progressive chain: each job renders one chunk of samples; the worker
     // re-submits the next chunk until sppBudget is reached (design 4.3).
@@ -873,6 +976,12 @@ std::string RenderServer::submitRender(const std::string& id, const std::string&
     task.exposure = session.exposure;
     task.warmTint = session.warmTint;
     task.saturationBoost = session.saturationBoost;
+    task.bloom = session.bloom;
+    task.sunHas = session.sunHas;
+    task.sunAz = session.sunAz;
+    task.sunEl = session.sunEl;
+    task.sunInt = session.sunInt;
+    task.reencode = reencode;
     auto job = scheduler_.submit(generation, [this, task](const RenderScheduler::Job& job) {
         runRenderChunk(task, job);
     });
@@ -913,13 +1022,23 @@ void RenderServer::runRenderChunk(const ChunkTask& task, const RenderScheduler::
             task.camera.direction.x, task.camera.direction.y, task.camera.direction.z,
             task.width, task.height, task.spp, task.neeK, task.exposure);
     try {
-        if (startSample >= task.spp) {
+        if (startSample >= task.spp && !task.reencode) {
+            // No encode follows this path — mark the record landed so REST
+            // doesn't gate on the encode that never comes (A4).
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                auto rit = renders_.find(task.renderId);
+                if (rit != renders_.end()) rit->second.encoded = true;
+            }
             publishEvent(task.sessionId,
                          eventJson("render-completed", task.renderId, task.sessionId,
                                    task.generation, startSample, task.spp,
                                    double(startSample), 0, task.width, task.height));
             return;
         }
+        // task.reencode && startSample >= spp falls through as a 0-sample
+        // chunk (A2): the sample loop no-ops, finalize + readback + encode
+        // re-publish the existing accumulation with new display params.
         if (startSample == 0)
             publishEvent(task.sessionId,
                          eventJson("render-started", task.renderId, task.sessionId,
@@ -929,7 +1048,7 @@ void RenderServer::runRenderChunk(const ChunkTask& task, const RenderScheduler::
         args.camera = task.camera;
         args.width = task.width;
         args.height = task.height;
-        args.spp = std::min(task.chunkSpp, task.spp - startSample);
+        args.spp = std::max(0, std::min(task.chunkSpp, task.spp - startSample));
         args.sppBudgetTotal = task.spp;
         args.pDirect = 0.5f;
         args.maxDepth = task.maxDepth;
@@ -947,9 +1066,16 @@ void RenderServer::runRenderChunk(const ChunkTask& task, const RenderScheduler::
             const char* o = std::getenv("RENDER_OIDN");
             if (!(o && o[0] == '1')) args.adaptiveMin = 0;
         }
-        // 方向太阳与 CLI 同源（RENDER_SUN_* env）——Bistro 内景的主直接光，
+        // 方向太阳与 CLI 同源：session override（/render 的 sunAz/El/Int，
+        // A3）优先，否则 RENDER_SUN_* env rig——Bistro 内景的主直接光，
         // 缺了它内景整体死黑（Dd 假暗 ~20×）。
-        applySunFromEnv(args);
+        if (task.sunHas) {
+            if (task.sunInt > 0.0f)
+                applySunParams(args, task.sunAz, task.sunEl, task.sunInt);
+            // sunInt 0 = explicit sun off: leave args.hasSun = 0.
+        } else {
+            applySunFromEnv(args);
+        }
         std::vector<PerPixelData> output(size_t(task.width) * task.height);
         const bool perfLog = [] {
             const char* p = std::getenv("RENDER_PERF");
@@ -999,23 +1125,42 @@ void RenderServer::runRenderChunk(const ChunkTask& task, const RenderScheduler::
                                   "_spp" + std::to_string(task.spp), output);
         }
 
-        // 阶段三 export point: publish a fresh preview after every productive
-        // chunk (also on the final one), so browsers can poll sequence bumps.
-        if (accumulated > startSample)
-            encodePreview(task, output);
-
-        // Terminal states (design 4.3): budget met -> completed, cancel
-        // request -> canceled. Continue the chain otherwise; FIFO queue +
-        // one chunk per job gives natural round-robin between sessions.
-        // (finalBytes was stored by encodePreview's final-chunk branch — the
-        // lossless PNG must not be overwritten by the JPEG preview.)
-        if (accumulated >= task.spp) {
-            publishEvent(task.sessionId,
-                         eventJson("render-completed", task.renderId, task.sessionId,
-                                   task.generation, accumulated, task.spp,
-                                   double(accumulated), 0, task.width, task.height));
-            return;
+        // 阶段三 export point (A4 pipelined): hand the chunk output to the
+        // encode thread and move on — the GPU worker starts the next chunk
+        // while postProcess/JPEG run on the CPU. render-completed for the
+        // final chunk is published by the encode path AFTER finalBytes are
+        // stored (emitCompleted), so GET /image never races the event.
+        // task.reencode (A2) enqueues with accumulated == startSample —
+        // that 0-sample chunk is exactly one encode of the old accumulation.
+        const bool productive = accumulated > startSample || task.reencode;
+        if (productive) {
+            EncodeJob job;
+            job.sessionId = task.sessionId;
+            job.renderId = task.renderId;
+            job.generation = task.generation;
+            job.width = task.width;
+            job.height = task.height;
+            job.spp = task.spp;
+            job.accumulatedSpp = accumulated;
+            job.denoise = task.denoise;
+            job.progressive = task.progressive;
+            job.emitCompleted = accumulated >= task.spp || task.reencode;
+            job.exposure = task.exposure;
+            job.warmTint = task.warmTint;
+            job.saturationBoost = task.saturationBoost;
+            job.bloom = task.bloom;
+            job.output = std::move(output);
+            enqueueEncode(std::move(job));
         }
+
+        // Terminal states (design 4.3): budget met -> completed (the event
+        // comes from the encode path), cancel request -> canceled. Continue
+        // the chain otherwise; FIFO queue + one chunk per job gives natural
+        // round-robin between sessions. (finalBytes was stored by the
+        // encode path's final-chunk branch — the lossless PNG must not be
+        // overwritten by the JPEG preview.)
+        if (accumulated >= task.spp || task.reencode)
+            return;
         if (job->cancelRequested()) {
             publishEvent(task.sessionId,
                          eventJson("render-canceled", task.renderId, task.sessionId,
@@ -1065,43 +1210,42 @@ void RenderServer::runRenderChunk(const ChunkTask& task, const RenderScheduler::
     }
 }
 
-void RenderServer::encodePreview(const ChunkTask& task,
-                                 const std::vector<PerPixelData>& output) {
-    const int width = task.width, height = task.height;
+void RenderServer::encodePreview(const EncodeJob& job) {
+    const int width = job.width, height = job.height;
     // Progressive denoise quality (design 9/批1): intermediate chunks of a
     // progressive chain encode quick (firefly clamp + ONE NL-means pass —
     // the frames are transient and the 7-pass ladder is the single largest
     // CPU item); the final chunk encodes OIDN-only quality 3 (RENDER_OIDN=1;
     // without OIDN linked it degrades to full NL-means). Non-progressive
     // renders keep quality 2 — the calibrated path.
-    const bool finalChunk = task.ctx->nextSample() >= task.spp;
-    const int denoiseQuality = !task.denoise ? 0
-                             : task.progressive ? (finalChunk ? 3 : 1)
+    const bool finalChunk = job.accumulatedSpp >= job.spp;
+    const int denoiseQuality = !job.denoise ? 0
+                             : job.progressive ? (finalChunk ? 3 : 1)
                                                 : 2;
     Photo photo;
     photo.allocate(width, height);
-    photo.exposure = task.exposure;
-    photo.warmTint = task.warmTint;
-    photo.saturationBoost = task.saturationBoost;
+    photo.exposure = job.exposure;
+    photo.warmTint = job.warmTint;
+    photo.saturationBoost = job.saturationBoost;
 
     // 精修链降噪（设计 9）：与 console 完全同源的 radiance/G-buffer 填充，
     // 让预览走同一条 NL-means 降噪路径——否则低 spp 的无降噪预览只剩
     // 高光轮廓（实测反馈）。
     std::vector<RadianceData> radD, radS, radI, radIs;
     std::vector<HitInfo> gbuffer;
-    if (task.denoise) {
-        const size_t n = output.size();
+    if (job.denoise) {
+        const size_t n = job.output.size();
         radD.resize(n); radS.resize(n); radI.resize(n); radIs.resize(n);
         gbuffer.resize(n);
     }
     // Same composite order as console's Photo fill loop.
-    for (size_t i = 0; i < output.size(); ++i) {
-        const PerPixelData& ppd = output[i];
+    for (size_t i = 0; i < job.output.size(); ++i) {
+        const PerPixelData& ppd = job.output[i];
         const float3 finalColor = ppd.radiance_Dd + ppd.radiance_Ds
                                 + ppd.radiance_Id + ppd.radiance_Is
                                 + ppd.emission;
         photo.channels.finalColor[i] = float4(finalColor, 1.0f);
-        if (task.denoise) {
+        if (job.denoise) {
             radD[i].radiance = ppd.radiance_Dd; radD[i].Var = ppd.var_Dd;
             radS[i].radiance = ppd.radiance_Ds; radS[i].Var = ppd.var_Ds;
             radI[i].radiance = ppd.radiance_Id; radI[i].Var = ppd.var_Id;
@@ -1116,35 +1260,40 @@ void RenderServer::encodePreview(const ChunkTask& task,
             gbuffer[i].opacity       = ppd.opacity;
         }
     }
-    if (task.denoise) {
+    if (job.denoise) {
         photo.radiance_Dd = radD.data();
         photo.radiance_Ds = radS.data();
         photo.radiance_Id = radI.data();
         photo.radiance_Is = radIs.data();
         photo.Gbuffer     = gbuffer.data();
     }
-    // Bloom follows the console knob (RENDER_BLOOM=0 disables): bright
-    // daylight scenes want it off — the Clum>=1 threshold fires on the
-    // sunlit street itself and the blur haze washes the frame.
+    // Bloom follows the console knob (RENDER_BLOOM=0 disables) unless the
+    // request pinned it (display-only A1): bright daylight scenes want it
+    // off — the Clum>=1 threshold fires on the sunlit street itself and the
+    // blur haze washes the frame.
     bool doBloom = true;
-    if (const char* bl = std::getenv("RENDER_BLOOM")) doBloom = bl[0] != '0';
+    if (job.bloom >= 0) doBloom = job.bloom != 0;
+    else if (const char* bl = std::getenv("RENDER_BLOOM")) doBloom = bl[0] != '0';
     photo.postProcess(Photo::Full |
                       (doBloom ? Photo::DoBloom : 0) |
-                      (task.denoise ? Photo::DoDenoise : 0),
-                      task.ctx->nextSample(), denoiseQuality);
+                      (job.denoise ? Photo::DoDenoise : 0),
+                      job.accumulatedSpp, denoiseQuality);
 
     const std::vector<uint8_t> rgb = photo.rgbBytes();
-    // Progressive previews encode JPEG (quality 90 — 4-5x faster than PNG,
-    // the frames are transient); the FINAL frame additionally encodes a
-    // lossless PNG for GET /api/renders/{id}/image (delivery stays PNG).
     std::vector<unsigned char> preview, finalBytes;
     auto writeBytes = [](void* context, void* data, int size) {
         auto* bytes = static_cast<std::vector<unsigned char>*>(context);
         const unsigned char* p = static_cast<const unsigned char*>(data);
         bytes->insert(bytes->end(), p, p + size);
     };
+    // Progressive previews encode JPEG — transient intermediate frames at
+    // quality 80 (smaller + faster to encode/download; the frames are
+    // replaced within a second anyway), the chain-final preview at 90 (it
+    // stays on screen). The FINAL frame additionally encodes a lossless PNG
+    // for GET /api/renders/{id}/image (delivery stays PNG).
+    const int jpegQ = finalChunk ? 90 : 80;
     stbi_write_jpg_to_func(writeBytes, &preview, width, height, 3,
-                           rgb.data(), 90);
+                           rgb.data(), jpegQ);
     if (finalChunk)
         stbi_write_png_to_func(writeBytes, &finalBytes, width, height, 3,
                                rgb.data(), width * 3);
@@ -1154,41 +1303,96 @@ void RenderServer::encodePreview(const ChunkTask& task,
     }();
     if (perfLog)
         fprintf(stderr, "PERF encode %s: denoiseQ=%d bytes=%zu final=%d\n",
-                task.renderId.c_str(), denoiseQuality, preview.size(),
+                job.renderId.c_str(), denoiseQuality, preview.size(),
                 (int)finalBytes.size());
 
     uint64_t sequence = 0;
     {
         std::lock_guard<std::mutex> lock(mutex_);
-        auto it = sessions_.find(task.sessionId);
+        auto it = sessions_.find(job.sessionId);
         if (it == sessions_.end()) return;
         SessionInfo& session = it->second;
         session.previewBytes = std::move(preview);
         session.previewWidth = width;
         session.previewHeight = height;
-        session.previewSpp = task.ctx->nextSample();
-        session.previewGeneration = task.generation;
+        session.previewSpp = job.accumulatedSpp;
+        session.previewGeneration = job.generation;
         ++session.previewSequence;
         sequence = session.previewSequence;
         if (session.activeJob)
             session.activeJob->progress().previewSequence = sequence;
-        auto rit = renders_.find(task.renderId);
+        auto rit = renders_.find(job.renderId);
         if (rit != renders_.end()) {
             rit->second.previewBytes = session.previewBytes;
             rit->second.previewSpp = session.previewSpp;
             rit->second.previewSequence = sequence;
             if (finalChunk) rit->second.finalBytes = std::move(finalBytes);
+            rit->second.encoded = true;
         }
     }
-    const int accumulated = task.ctx->nextSample();
-    publishEvent(task.sessionId,
-                 eventJson("progress", task.renderId, task.sessionId,
-                           task.generation, accumulated, task.spp,
+    const int accumulated = job.accumulatedSpp;
+    publishEvent(job.sessionId,
+                 eventJson("progress", job.renderId, job.sessionId,
+                           job.generation, accumulated, job.spp,
                            double(accumulated), sequence, width, height));
-    publishEvent(task.sessionId,
-                 eventJson("preview-ready", task.renderId, task.sessionId,
-                           task.generation, accumulated, task.spp,
+    publishEvent(job.sessionId,
+                 eventJson("preview-ready", job.renderId, job.sessionId,
+                           job.generation, accumulated, job.spp,
                            double(accumulated), sequence, width, height));
+    // Final chunk (A4): completion is announced here — after finalBytes are
+    // stored — instead of from the GPU worker, so a browser reacting to
+    // render-completed can immediately GET /image.
+    if (job.emitCompleted)
+        publishEvent(job.sessionId,
+                     eventJson("render-completed", job.renderId, job.sessionId,
+                               job.generation, accumulated, job.spp,
+                               double(accumulated), 0, width, height));
+}
+
+void RenderServer::enqueueEncode(EncodeJob&& job) {
+    bool queued = false;
+    {
+        std::lock_guard<std::mutex> lock(encodeMutex_);
+        if (!encodeStopping_ && encodeQueue_.size() < kMaxEncodeQueue) {
+            encodeQueue_.push_back(std::move(job));
+            queued = true;
+        }
+    }
+    if (queued) {
+        encodeCv_.notify_one();
+        return;
+    }
+    // Queue full or shutting down: backpressure — encode on the caller
+    // (GPU worker) thread, i.e. the pre-pipeline serialized behavior.
+    encodePreview(job);
+}
+
+void RenderServer::encodeLoop() {
+    for (;;) {
+        EncodeJob job;
+        {
+            std::unique_lock<std::mutex> lock(encodeMutex_);
+            encodeCv_.wait(lock, [this] { return encodeStopping_ || !encodeQueue_.empty(); });
+            if (encodeQueue_.empty()) {
+                if (encodeStopping_) return;
+                continue;
+            }
+            job = std::move(encodeQueue_.front());
+            encodeQueue_.pop_front();
+        }
+        try {
+            encodePreview(job);
+        } catch (...) {
+            // The worker's own chunk try/catch published render-failed for
+            // render exceptions; an encode-side failure must not kill the
+            // encode thread, so report and keep draining.
+            publishEvent(job.sessionId,
+                         eventJson("render-failed", job.renderId, job.sessionId,
+                                   job.generation, job.accumulatedSpp, job.spp,
+                                   double(job.accumulatedSpp), 0, job.width,
+                                   job.height));
+        }
+    }
 }
 
 std::string RenderServer::previewData(const std::string& id, int& status,
@@ -1331,11 +1535,17 @@ std::string RenderServer::renderStatus(const std::string& renderId, int& status)
         return R"({"error":"render_not_found"})";
     }
     const RenderRecord& record = it->second;
+    // A4 encode pipeline: the scheduler job finishes before the encode
+    // thread lands the bytes — hold "completed" back until encoded so REST
+    // pollers never race GET /image (WS render-completed already waits).
+    std::string state = record.timedOut ? "failed"
+                                      : stateName(record.job->state());
+    if (state == "completed" && !record.encoded) state = "running";
     std::ostringstream body;
     body << "{\"renderId\":\"" << renderId
          << "\",\"sessionId\":\"" << record.sessionId
          << "\",\"generation\":" << record.generation
-         << ",\"state\":\"" << (record.timedOut ? "failed" : stateName(record.job->state())) << "\""
+         << ",\"state\":\"" << state << "\""
          << ",\"sample\":" << record.job->progress().sample
          << ",\"sampleBudget\":" << record.job->progress().sampleBudget
          << ",\"avgSpp\":" << record.job->progress().averageSpp
