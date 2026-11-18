@@ -88,7 +88,7 @@ Raypr3sso/
 ├── models/                # Bistro 模型文件
 │   └── Bistro_v5_2/       # ~1.3M 面 (内景) / ~2.8M 面 (外景)
 ├── output/                # 渲染输出
-├── reference/             # CPU 参考实现 (Raym0nade)
+├── reference/             # CPU 参考实现 Raym0nade（本地副本，不随仓库分发）
 └── build/                 # 构建输出
 ```
 
@@ -343,7 +343,7 @@ direction = 用户指定             # 视线方向
 
 #### 参数推导来源
 
-以上参数精确对应 [Raym0nade](reference/) 参考项目 `renderArguments.txt` 中的内景参数：
+以上参数精确对应 [Raym0nade](https://github.com/lemonchu/Raym0nade) 参考项目 `renderArguments.txt` 中的内景参数：
 
 ```
 参考项目原始参数:
@@ -418,7 +418,7 @@ Raypr3sso up = -reference_up
 
 ## 参考实现
 
-`reference/` 目录包含 [Raym0nade](https://github.com/lemonchu/Raym0nade) 的本地副本，是纯 CPU 的参考路径追踪器。详细文档见 [reference/README.md](reference/README.md)。
+`reference/` 目录为 [Raym0nade](https://github.com/lemonchu/Raym0nade)（MIT，© Meng Chu & Yuchen Yang）的本地副本，纯 CPU 参考路径追踪器。**该副本不随本仓库分发**（`.gitignore` 已排除）；如需复现对比，自行克隆原项目放到 `reference/` 即可，脚本引用的路径（如 `reference/official_bistro_daylight.png`）随之就位。
 
 关键差异：
 
@@ -1150,3 +1150,7 @@ kernel 每像素循环内每 adaptiveCheck 个样本检查一次四个 AOV 亮�
 **P4d LUT 亮度分带（`RENDER_GRADE_BANDS`）**：`scripts/make_lut_grade.py` 按亮度 9 带中位数增益拟合（抗内容错位），管线 gammaCorrect 末段分段线性施加。因 grade 是最后一步无下游，**离线对成图施加新 bands ≡ 重渲**（省 70 分钟）：v10→v11 median 0.270→0.306、mean 0.397（官方 0.404）、street 0.98×。
 
 **v11 交付指标**：R/B 1.053（官方 1.019）、mean 0.98×、median 0.88×、street 0.98×、awning 0.81×、facade 1.54×（GI 残差）、Vespa 蓝色清晰 0.77×、hf_flat 0.022（无可见噪点）。**遗留**：facade 1.5×（纯反弹 GI 分布，需更强 AO 或官方 rig）、Vespa 饱和度浅于官方浓蓝、整体仍略冷略暗——均为 rig/几何级差异，配色结构（暖阳冷影+各固有色分区）已按官方特征实现。
+
+## 许可证
+
+MIT（见 [LICENSE](LICENSE)）。第三方组件：stb（public domain/MIT）、three.js（MIT）；`reference/` 为 Raym0nade（MIT © Meng Chu & Yuchen Yang）本地副本，不随本仓库分发；Bistro 场景资产与官方渲染图版权归 [NVIDIA ORCA](https://developer.nvidia.com/orca/amazon-lumberyard-bistro)。

@@ -13,14 +13,8 @@ output_review/
 # ---- 第三方预编译二进制（OIDN 可选依赖，~80MB）----
 external/oidn/
 
-# ---- 参考实现的工作目录与二进制（保留 src/docs）----
-reference/build/
-reference/lib/
-reference/output/
-reference/Demo
-reference/FXAA
-reference/models
-reference/*.png
+# ---- Raym0nade CPU 参考实现：本地副本，不随仓库分发（获取方式见 README）----
+reference/
 
 # ---- 会话与临时文件 ----
 .zcode/
