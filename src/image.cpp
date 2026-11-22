@@ -1,4 +1,5 @@
 #include "image.h"
+#include "image_gpu.h"
 #ifdef RENDERER_HAS_OIDN
 #include <OpenImageDenoise/oidn.h>
 #endif
@@ -75,6 +76,11 @@ void Photo::postProcess(int shadeOptions, int spp, int denoiseQuality) {
     // runtime (applyPresetRig); re-read the post-processing knobs cached in
     // this file before anything below uses them.
     refreshRenderEnv();
+    // RENDER_POST_GPU=1: full CUDA mirror of this function (see image_gpu.h).
+    // Statistical equivalence, NOT byte identity — the CPU path below stays
+    // the default and keeps the byte-level regression standard.
+    if (gpuPostEnabled() && postProcessGPU(*this, shadeOptions, spp, denoiseQuality))
+        return;
     // RENDER_SPP: offline backdoor — drive the SPP-adaptive gates from dumped
     // AOVs without re-rendering.
     int sppEff = spp;
@@ -849,6 +855,15 @@ void refreshRenderEnv() {
         g_contrast = parseContrastCurve();
         cachedCurveEnv = curveEnv;
     }
+}
+
+// Accessors shared with the GPU post path (image_gpu.cu) — the CUDA mirror
+// must see the same refreshRenderEnv-managed caches as the CPU pipeline.
+float getDenoiseNoiseTarget() { return g_denoiseNoiseTarget; }
+bool  getUseAcesTonemap()     { return g_useAcesTonemap; }
+void  getContrastCurveLUT(float* lut, bool& on) {
+    on = g_contrast.on;
+    if (on) memcpy(lut, g_contrast.lut, sizeof(float) * 1024);
 }
 
 // Shared env->Photo grade assembly (declared in image.h). Mirrors the console

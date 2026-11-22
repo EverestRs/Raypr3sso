@@ -14,11 +14,16 @@ struct RadianceData {
     __host__ __device__ RadianceData() = default;
 };
 
-// Accumulate a radiance sample into RadianceData (with variance tracking)
+// Accumulate a radiance sample into RadianceData (with variance tracking).
+// CPU-only inline helper (glm::dot) — unreferenced by the current pipelines;
+// hidden from CUDA TUs, where types.h maps float3 to the built-in vector and
+// no glm namespace exists.
+#ifndef __CUDACC__
 inline void accumulateInwardRadiance(RadianceData& rd, float3 inradiance, float weight) {
     rd.radiance += inradiance * weight;
     rd.Var += glm::dot(inradiance, inradiance) * weight;
 }
+#endif
 
 // ---- Spatial Denoising Functions ----
 // Re-read the env knobs cached in image.cpp file-statics (tone map choice,

@@ -131,6 +131,8 @@ set(SOURCES
 set(CUDA_SOURCES
     # bvh_gpu.cu is #included from render_gpu.cu to avoid linker stripping PTX
     src/render_gpu.cu
+    # GPU post-processing pipeline (RENDER_POST_GPU=1) — mirrors image.cpp
+    src/image_gpu.cu
 )
 
 # ---- Main Executable ----
@@ -151,6 +153,7 @@ add_executable(render_server
     src/gpu_utils.cpp
     src/gpu_scene.cpp
     src/image.cpp
+    src/image_gpu.cu
     src/render.cpp
     src/render_gpu.cu
 )
