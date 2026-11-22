@@ -131,8 +131,8 @@ private:
         // Wavefront pipeline state owned by the session (design 5.2):
         // buffers and accumulation persist across render chunks; reset
         // when the generation or size changes. Destroying it frees CUDA
-        // resources and must eventually be marshaled onto the GPU worker
-        // (sessions are not destroyed in the current skeleton).
+        // resources: session GC (design 13) erases idle sessions on the
+        // GPU worker, so the free is marshaled there like every CUDA op.
         std::unique_ptr<WavefrontRenderContext> wavefront;
         uint64_t accumGeneration = 0;  // generation the accumulation belongs to
         int accumWidth = 0, accumHeight = 0;

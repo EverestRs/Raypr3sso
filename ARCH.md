@@ -1,5 +1,10 @@
 # 光线追踪渲染器 — 技术设计文档 (ARCH)
 
+> **文档状态（2026-11-22）**：本文档是项目启动期的设计蓝图，接口命名与实现细节已随
+> 开发演进（如 GPU 纹理从 cudaArray+textureObject 演进为 BC 块驻显存+内核解码，见
+> ADR-14；§15-18 原标注"待实现"的模块均已落地）。**实现现状与全部实测数据以
+> [README.md](README.md) 技术报告（§1-§13）为准**；本文保留作设计决策与演进记录。
+
 ## 1. 项目结构
 
 ```
@@ -812,7 +817,11 @@ public:
 
 ---
 
-## 15. 射线微分模块 — `render.h/.cpp` (待实现)
+## 15. 射线微分模块 — `render.h/.cpp` (已实现：CPU 后端)
+
+> **状态**：CPU 后端已落地（`render.cpp` 的 `calc_dPdxy/calc_dDdxy` +
+> `ImageTexture::sample(mipLevel)` 的 mip 链，渲染主循环已传入初始 ray differential）。
+> GPU kernel 为扁平缓冲手动双线性采样、无 mip，斜视角纹理过滤仍是潜在改进项。
 
 ### 15.1 设计目标
 
@@ -858,7 +867,7 @@ void regularizeRoughness(float &roughness, float roughnessFactor, int depth) {
 
 ---
 
-## 16. 完整 Disney BSDF (待实现)
+## 16. 完整 Disney BSDF (已实现)
 
 ### 16.1 当前已实现
 
@@ -869,7 +878,11 @@ void regularizeRoughness(float &roughness, float roughnessFactor, int depth) {
 | Fresnel (Schlick) | ✅ 已实现 |
 | Metallic 混合 | ✅ 已实现 |
 
-### 16.2 待补充
+### 16.2 Subsurface / Sheen / Clearcoat（已实现）
+
+> **状态**：四层全部落地，CPU/GPU 同公式（`sampling.cpp` 的 `BSDF::eval` 与
+> `render_gpu.cu` 的 diffuse/sheen 分支）；clearcoat GTR1 逆 CDF 的潜伏 bug 已在
+> 2026-09-13 全代码审计修复（README §13.1）。Bistro 资产 clearcoat=0，画面无感。
 
 ```cpp
 // ---- Subsurface 散射层 ----
@@ -919,7 +932,11 @@ getBSDF(outDir)
 
 ---
 
-## 17. 空间滤波降噪 (待实现)
+## 17. 空间滤波降噪 (已实现，且已超出本设计)
+
+> **状态**：落地实现远超本节蓝图——7 遍多尺度 log 域 NL-means、5 项边缘感知权重、
+> firefly 双门、SPP 自适应门限、方差引导混合与 albedo 细节回注，另集成 Intel OIDN
+> 双路降噪。完整设计与实测见 README §8 与 §13.5/§13.12。
 
 ### 17.1 设计目标
 
@@ -971,7 +988,11 @@ void filterRadiance(RadianceData *radiance, const HitInfo *Gbuffer,
 
 ---
 
-## 18. 光源面片重要性分布 (待实现)
+## 18. 光源面片重要性分布 (已实现)
+
+> **状态**：两级重要性采样已落地——对象级按功率 CDF（距离加权 `power/(dist²+area)`）、
+> 对象内按三角形面积前缀和均匀采样；K 多样本平均与 power-heuristic MIS 配对见
+> README §5.1。
 
 ### 18.1 设计目标
 
@@ -1044,7 +1065,7 @@ assimp 加载完成后:
 
 | ID | 决策 | 理由 | 影响 |
 |----|------|------|------|
-| ADR-01 | 使用 `cudaArray` + `textureObject` 而非 global memory 采样 | 硬件双线性过滤 + mipmap 自动管理 + 纹理缓存优化 | 增加纹理上传复杂度，但 Kernel 性能高 2-3x |
+| ADR-01 | 使用 `cudaArray` + `textureObject` 而非 global memory 采样 | 硬件双线性过滤 + mipmap 自动管理 + 纹理缓存优化 | 增加纹理上传复杂度，但 Kernel 性能高 2-3x。**已取代 → ADR-14** |
 | ADR-02 | BVH 用 SAH CPU 构建 + 展平为 Linear BVH | 构建简单，GPU 遍历高效 | 构建时间 20-60s，通过磁盘缓存避免重复构建 |
 | ADR-03 | GPU RNG 使用 cuRAND Philox | 质量高、周期长、寄存器友好 | 增加 cuRAND 依赖，但这是 CUDA 标准库 |
 | ADR-04 | AOV 分离在路径追踪时完成，而非后处理 | 避免二次遍历场景，减少带宽 | Kernel 需要维护 5 个累加器，增加寄存器压力 |
@@ -1057,3 +1078,4 @@ assimp 加载完成后:
 | ADR-11 | 光源采样采用两级分布：光源级 + 面片级 | Bistro 夜景有 ~120 光源，先选光源再选面片比全部面片统一采样更高效 | 增加采样代码复杂度，但收敛速度明显提升 |
 | ADR-12 | BSDF 粗糙度随路径深度正则化（regularization） | 防止光滑表面在低采样率下产生 firefly（极高亮度异常像素） | 轻微增加偏差（bias），但显著改善视觉效果 |
 | ADR-13 | 射线微分从相机光线推导，而非从屏幕空间差分计算 | 光线方向微分可直接给出纹理坐标的各向异性导数 | 增加 generateRay 计算量 ~10%，但纹理过滤精度更高 |
+| ADR-14 | GPU 纹理改为 uchar4 扁平大缓冲手动双线性采样，后进一步演进为 BC 块驻显存 + 内核软件解码（取代 ADR-01） | Bistro 213 张 2048² 贴图双份拷贝需 ~28GB 且 OOM 静默白屏；扁平缓冲 ~3.6GB，BC 驻显存 ~0.73GB（纹理显存 -80%）；整数取整逐位复刻 CPU 解码，与 CPU 渲染字节级一致 | 失去硬件过滤与 mip（斜视角过滤为遗留改进项）；上传失败由静默跳过改为显式告警中止 |

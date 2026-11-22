@@ -68,28 +68,30 @@
 
 ```
 Raypr3sso/
-├── CMakeLists.txt         # 构建文件
-├── external/              # 第三方库 (glm, stb)
-├── src/                   # 源码
-│   ├── main.cpp           # 入口 + 交互式控制台
-│   ├── camera.h / .cpp    # 相机模型
-│   ├── render.cpp         # CPU 渲染引擎
-│   ├── render_gpu.cu      # GPU 渲染 Kernel
-│   ├── model.cpp          # FBX 场景加载 (assimp)
-│   ├── bvh.cpp            # BVH 构建与 CPU 遍历
-│   ├── bvh_gpu.cu         # GPU Linear BVH
-│   ├── sampling.cpp       # BSDF + 重要性采样
-│   ├── material.cpp       # 材质与纹理
-│   ├── image.cpp          # 后处理 (Bloom/FXAA/DoF/降噪)
-│   ├── console.cpp        # 交互式控制台
-│   └── geometry.cpp       # 几何工具
-├── include/               # 公共头文件
-│   └── types.h            # 基础类型别名
-├── models/                # Bistro 模型文件
-│   └── Bistro_v5_2/       # ~1.3M 面 (内景) / ~2.8M 面 (外景)
-├── output/                # 渲染输出
-├── reference/             # CPU 参考实现 Raym0nade（本地副本，不随仓库分发）
-└── build/                 # 构建输出
+├── CMakeLists.txt           # 构建文件（目标：Raypr3sso CLI + render_server）
+├── demo.sh                  # 一键：预检显存 → 构建 → 起服务端+页面 → 开浏览器
+├── external/                # 第三方库 (glm, stb；可选 OIDN 预编译包)
+├── include/                 # 公共头文件 (types.h, math_utils.h)
+├── src/                     # 源码
+│   ├── console.cpp          # 交互式控制台（CLI 渲染入口）
+│   ├── model.cpp / material.cpp      # FBX 加载 (assimp) + DDS/BC 纹理解码
+│   ├── bvh.cpp / bvh_gpu.cu          # SAH BVH 构建 + GPU Linear BVH
+│   ├── sampling.cpp                  # Disney BSDF + 重要性采样
+│   ├── render.cpp                    # CPU 后端（参考验证用）
+│   ├── render_gpu.cu                 # GPU megakernel 路径追踪
+│   ├── render_wavefront.cu           # GPU 波前管线（重排序/材质分批）
+│   ├── image.cpp                     # 降噪 (NL-means/OIDN) + 后处理
+│   ├── gpu_scene.cpp / gpu_utils.cpp # GPU 场景常驻资源 / 上传
+│   └── render_server.cpp / render_job.cpp  # 远程渲染服务（HTTP+WS）
+├── threejs/                 # 浏览器前端（three.js 远程客户端）
+├── scripts/                 # 验证/标定/交付脚本（attic/ 为历史归档）
+├── deploy/                  # systemd / nginx / Dockerfile 部署件
+├── gallery/                 # 交付渲染图与对比图
+├── models/                  # Bistro 模型文件（需自行下载）
+│   └── Bistro_v5_2/         # ~1.3M 面 (内景) / ~2.8M 面 (外景)
+├── output/                  # 渲染输出
+├── reference/               # CPU 参考实现 Raym0nade（本地副本，可选，不随仓库分发）
+└── build/                   # 构建输出
 ```
 
 ## 环境依赖
@@ -120,7 +122,7 @@ cmake .. -DCMAKE_BUILD_TYPE=Release -DCUDA_ARCH=86
 # 编译
 make -j$(nproc)
 
-# 产物位于 build/Raypr3sso
+# 产物位于 build/Raypr3sso（CLI）与 build/render_server（远程渲染服务）
 ```
 
 ### CMake 选项
@@ -1150,6 +1152,20 @@ kernel 每像素循环内每 adaptiveCheck 个样本检查一次四个 AOV 亮�
 **P4d LUT 亮度分带（`RENDER_GRADE_BANDS`）**：`scripts/make_lut_grade.py` 按亮度 9 带中位数增益拟合（抗内容错位），管线 gammaCorrect 末段分段线性施加。因 grade 是最后一步无下游，**离线对成图施加新 bands ≡ 重渲**（省 70 分钟）：v10→v11 median 0.270→0.306、mean 0.397（官方 0.404）、street 0.98×。
 
 **v11 交付指标**：R/B 1.053（官方 1.019）、mean 0.98×、median 0.88×、street 0.98×、awning 0.81×、facade 1.54×（GI 残差）、Vespa 蓝色清晰 0.77×、hf_flat 0.022（无可见噪点）。**遗留**：facade 1.5×（纯反弹 GI 分布，需更强 AO 或官方 rig）、Vespa 饱和度浅于官方浓蓝、整体仍略冷略暗——均为 rig/几何级差异，配色结构（暖阳冷影+各固有色分区）已按官方特征实现。
+
+### 13.14 GPU 后处理管线 + OIDN CUDA 设备 + fast_math 开关（2026-11-22）
+
+三项性能项一次交付：
+
+**1) 后处理 GPU 化（`RENDER_POST_GPU=1`，`src/image_gpu.cu`）**：`Photo::postProcess` 的完整 CUDA 镜像——relativeClamp / filterVar / fireflyClamp / 归一化 / NL-means 多尺度阶梯（log 域 + 5 项边缘感知权重 + mcVar 噪声引导混合）/ AO / albedo 细节回注 / energyGain / emission 降噪 / 重组 / tonemap(WB) / bloom / gamma(ACES/tanh + saturation + curve LUT + split-tone + grade bands) / despeckle / FXAA 全部 kernel 化。抽样统计（1/7、1/13、1/4）使用与 CPU 相同的步长，样本回 host 做 `nth_element` 中位数；结束时回写全部 host 缓冲（AOV / finalColor / emission / oidnColor / sunliness），下游 save / DUMPAOV / 服务端预览编码无感。CPU 后处理代码零改动（默认路径零回归）。**验收（ball 512×512@512spp，同二进制开关 A/B）**：DENOISE 日志逐项一致（lumScale=0.0567 Sdn=3.18 refGain=0.825），输出 PNG **100% 像素一致**（max absdiff 1，uint8 舍入级）；GPU 后处理全程 59ms（upload 28 + denoise 25 + display 1 + download 4）。注意：该路径与 CPU 构建的浮点结果跨编译器存在 ulp 级差异，验收标准为统计等价；字节级 A/B 标准仍适用于默认 CPU 路径。
+
+**2) OIDN CUDA 设备（`RENDER_OIDN_DEVICE=gpu`，默认 cpu）**：预编译 OIDN 2.2 包自带 `libOpenImageDenoise_device_cuda`。实测发现 CUDA 后端**不能解引用普通 host malloc 内存**（报 "image data not accessible by the device"）——OIDN 调用统一走 `oidnRunRT`（image_gpu.cu，CLI 与服务端共用）：GPU 模式下 color/albedo/normal 经 `oidnNewBuffer` 设备缓冲 staging（`cudaMemcpy` 进/出，UVA 寻址）；**任何失败（设备创建 / commit / filter 执行 / staging / 拷回）自动回退 CPU 设备**（历史 shared-image 路径，字节级不变）。实测 GPU vs CPU 设备输出：85% 像素逐字节一致、其余 ±1（后端 FP 差异），median/mean/std 全部一致。
+
+**3) `--use_fast_math` 开关（CMake `-DRENDERER_FAST_MATH=ON`，默认 OFF）**：§13.7 的评估落地——CUDA kernel 提速选项，代价是破坏字节级可复现验证（ulp 级 FP 差异），只用于吞吐实验；构建摘要打印状态，默认关闭零影响。
+
+组合验证：`RENDER_POST_GPU=1 + RENDER_OIDN=1 + RENDER_OIDN_DEVICE=gpu` 单管线全通（POSTGPU 173ms 含 OIDN GPU 滤波）。`render_server` 同步编译 image_gpu.cu，渐进预览链（每 chunk 边界的 `encodePreview`）与精修终帧直接受益。
+
+**独立代码审计（交付当轮，22 项逐项对照 CPU 语义）**：发现并修复 3 处——① P0：sunliness 缓冲在 `DoDenoise` 关闭时未写入但被 `kGamma` 按指针非空消费（垃圾显存），改用 `sunlinessReady` 标志门控（与 CPU 的 `sunliness.empty()` 回退 luma 键语义对齐）；② P1：`photo.oidnColor` host 副本原在 OIDN 后立即赋值（缺 AO/energyGain 乘子且中途失败残留旧值），改为最终回传段从 device 同步（与 CPU 原地修改语义一致，失败回退路径零残留）；③ P2：回传段半更新态以注释标注（概率极低，接受）。修复后回归：常规 A/B 100% 像素一致（maxdiff 1），`RENDER_DENOISE=0 + RENDER_SPLIT_KEY=sun` 组合 100% 一致且 maxdiff 0。已核对一致项 19 个（NL-means 全权重项、firefly 双门、AO hash/tap、detail、energyGain r320 死区、WB/bloom/gamma/despeckle/FXAA/emission/重组、抽样 stride、缓冲生命周期无泄漏、server encodePreview 衔接、CMake 覆盖、符号一致性）。已知限制：DevBuf 每次调用全量 cudaMalloc/Free（约 0.3KB/px），server 逐 chunk 调用时有毫秒级开销，跨 chunk 缓存列为后续优化项。
 
 ## 许可证
 
