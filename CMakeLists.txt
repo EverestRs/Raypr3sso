@@ -15,6 +15,11 @@ set(CMAKE_CUDA_STANDARD_REQUIRED ON)
 
 # ---- Options ----
 option(RENDERER_USE_TINYEXR "Enable OpenEXR output via tinyexr" OFF)
+# Perf option: --use_fast_math on the CUDA kernels (~5-10% measured on this
+# renderer family). It trades IEEE strictness for speed and therefore BREAKS
+# the byte-level A/B regression standard (ulp-level FP differences everywhere);
+# keep OFF for verification builds, enable for throughput experiments.
+option(RENDERER_FAST_MATH "Enable --use_fast_math for CUDA kernels (breaks byte-level reproducibility)" OFF)
 
 # ---- CUDA Architecture ----
 # Target GPU: NVIDIA Tesla V100 (sm_70, Volta).
@@ -201,6 +206,12 @@ target_compile_options(Raypr3sso PRIVATE
     $<$<COMPILE_LANGUAGE:CUDA>:--extra-device-vectorization>
     $<$<COMPILE_LANGUAGE:CUDA>:-lineinfo>
 )
+if(RENDERER_FAST_MATH)
+    target_compile_options(Raypr3sso PRIVATE
+        $<$<COMPILE_LANGUAGE:CUDA>:--use_fast_math>)
+    target_compile_options(render_server PRIVATE
+        $<$<COMPILE_LANGUAGE:CUDA>:--use_fast_math>)
+endif()
 
 # ---- Platform specific ----
 if(WIN32)
@@ -214,4 +225,5 @@ install(TARGETS Raypr3sso DESTINATION bin)
 message(STATUS "Raypr3sso Configuration:")
 message(STATUS "  CUDA Architecture : ${CUDA_ARCH}")
 message(STATUS "  tinyexr support   : ${RENDERER_USE_TINYEXR}")
+message(STATUS "  fast_math         : ${RENDERER_FAST_MATH}")
 message(STATUS "  Build type        : ${CMAKE_BUILD_TYPE}")
