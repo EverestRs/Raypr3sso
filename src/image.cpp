@@ -252,24 +252,15 @@ void Photo::postProcess(int shadeOptions, int spp, int denoiseQuality) {
                     float3 nn = Gbuffer[i].shapeNormal;
                     normal[i*3+0] = nn.x; normal[i*3+1] = nn.y; normal[i*3+2] = nn.z;
                 }
-                OIDNDevice dev = oidnNewDevice(OIDN_DEVICE_TYPE_CPU);
-                oidnCommitDevice(dev);
-                OIDNFilter flt = oidnNewFilter(dev, "RT");
-                oidnSetSharedFilterImage(flt, "color",  color.data(),  OIDN_FORMAT_FLOAT3, width, height, 0, 3*sizeof(float), 0);
-                oidnSetSharedFilterImage(flt, "albedo", albedo.data(), OIDN_FORMAT_FLOAT3, width, height, 0, 3*sizeof(float), 0);
-                oidnSetSharedFilterImage(flt, "normal", normal.data(), OIDN_FORMAT_FLOAT3, width, height, 0, 3*sizeof(float), 0);
-                oidnSetSharedFilterImage(flt, "output", out.data(),    OIDN_FORMAT_FLOAT3, width, height, 0, 3*sizeof(float), 0);
-                oidnSetFilterBool(flt, "hdr", true);
-                oidnCommitFilter(flt);
-                oidnExecuteFilter(flt);
-                const char* err = nullptr;
-                if (oidnGetDeviceError(dev, &err) != OIDN_ERROR_NONE)
-                    fprintf(stderr, "OIDN error: %s\n", err ? err : "?");
-                oidnReleaseFilter(flt);
-                oidnReleaseDevice(dev);
-                oidnColor = out;
-                fprintf(stderr, "OIDN: denoised %dx%d (RT filter, albedo+normal guides)\n", width, height);
-                fflush(stderr);
+                // Device selection honours RENDER_OIDN_DEVICE=cpu|gpu
+                // (oidnRunRT: CUDA device with device-buffer staging and a
+                // byte-identical CPU fallback — the prebuilt OIDN 2.2 package
+                // ships libOpenImageDenoise_device_cuda).
+                if (oidnRunRT(color, albedo, normal, out, width, height)) {
+                    oidnColor = out;
+                    fprintf(stderr, "OIDN: denoised %dx%d (RT filter, albedo+normal guides)\n", width, height);
+                    fflush(stderr);
+                }
             }
         }
 #endif
