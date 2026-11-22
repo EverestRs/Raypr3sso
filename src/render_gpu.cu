@@ -174,6 +174,16 @@ bool applySunFromEnv(GPURenderArgs& args) {
     return applySunParams(args, az, el, inten);
 }
 
+// Per-render physical env knobs shared by both hosts (console + server):
+// the server fills these from its parsed RigProfile instead (task channel),
+// so env is only the CLI/startup-rig fallback path.
+void applyPhysicalEnvFromEnv(GPURenderArgs& args) {
+    if (const char* is = std::getenv("RENDER_INDIRECT_SCALE"))
+        args.indirectScale = fmaxf(0.0f, std::strtof(is, nullptr));
+    if (const char* es = std::getenv("RENDER_EMISSION_SCALE"))
+        args.emissionScale = fmaxf(0.0f, std::strtof(es, nullptr));
+}
+
 // Foliage shadow transmission (RENDER_LEAF_SHADOW_TINT, default 1.0):
 // alpha-cutout holes pass this fraction of the light. 1.0 = holes fully
 // open (original behaviour). Real canopies leak less — sub-texel leaf
@@ -803,7 +813,8 @@ __device__ inline float3 gpu_sampleNormalMap(int texId, float u, float v,
 // GPU HitInfo builder (with texture support)
 // =========================================================================
 __device__ HitInfo gpu_getHitInfo(const Ray& ray, const HitRecord& hit,
-                                   const GPUModelData& model) {
+                                   const GPUModelData& model,
+                                   float emissionScale) {
     const int faceIdx = hit.faceIdx;
     const int triBase = faceIdx * 3;
 
@@ -919,7 +930,11 @@ __device__ HitInfo gpu_getHitInfo(const Ray& ray, const HitRecord& hit,
     // Emissive texture sampling (GPU path): if an emissive texture exists, use it
     // to modulate the emission factor, giving lamps their patterned appearance
     // instead of uniform white blobs. Emission maps are sRGB too.
-    info.emission = mb.emissionFactors[matId];
+    // Emissive energy scale moved off the load-time material bake (per-
+    // render / per-profile): multiply the raw factor here, BEFORE the
+    // texture modulation, so the product chain matches the historical
+    // (factor x scale) x emCol order bit-for-bit at scale=1.
+    info.emission = mb.emissionFactors[matId] * emissionScale;
     if (mb.emissionTexIds[matId] >= 0) {
         float4 emTex = gpu_sampleTexture(mb.emissionTexIds[matId], uv.x, uv.y, mb);
         // Emissive contrast gamma 5 — matches the bakeAverageTexel domain and
@@ -1018,7 +1033,9 @@ __device__ float3 gpu_transparentShadow(float3 org, float3 dir, float maxDist,
                 return T;
             }
         }
-        HitInfo hs = gpu_getHitInfo(Ray(org, dir), h, model);
+        // Shadow helper: emission is not consumed on this path (opacity/
+        // normal/eta only) — the scale arg is inert here.
+        HitInfo hs = gpu_getHitInfo(Ray(org, dir), h, model, 1.0f);
         // Alpha-cutout foliage: texels with alpha < 0.5 are holes — the shadow
         // ray passes through, matching the camera-path cutout branch (otherwise
         // canopies would punch holes for camera rays but cast solid shadows).
@@ -1155,7 +1172,7 @@ __device__ __noinline__ bool gpu_shadeBounce(
     }
 
     // Build surface info using texture-aware hit info builder
-    HitInfo surface = gpu_getHitInfo(ray, hit, model);
+    HitInfo surface = gpu_getHitInfo(ray, hit, model, args.emissionScale);
 
     // Roughness regularization: widen this and all subsequent lobes to the
     // max roughness seen so far on the path (matches reference)
@@ -1375,8 +1392,10 @@ __device__ __noinline__ bool gpu_shadeBounce(
                 }
                 // Photon travels from the emitter toward the shading point:
                 // that is -wi (wi points at the light). The lobe must weight
-                // the photon's travel direction.
-                float3 contrib = lt.emission * bsdfVal * NdotL / pdfSA * w_nee
+                // the photon's travel direction. Light radiance carries the
+                // per-render emission scale (the load-time bake stays raw).
+                const float3 ltEm = lt.emission * args.emissionScale;
+                float3 contrib = ltEm * bsdfVal * NdotL / pdfSA * w_nee
                                * gpu_emissionLobe(model.materials, lt.matId, -wi, ln)
                                * shadowTint;
                 sumContrib += throughput * contrib / float(K);

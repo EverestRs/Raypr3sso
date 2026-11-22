@@ -13,6 +13,7 @@
 #include <vector>
 
 #include "render_job.h"
+#include "scene_presets.h"   // RigProfile (position-aware rig profiles)
 #include "camera.h"
 #include "model.h"
 #include "gpu_scene.h"
@@ -121,6 +122,12 @@ private:
         float indoorMin[3] = {0.0f, 0.0f, 0.0f};
         float indoorMax[3] = {0.0f, 0.0f, 0.0f};
         float indoorMargin = 1.5f;
+        // Position-aware rig profiles (parsed from the preset at session
+        // creation — delivered per render via the task channel, NEVER via
+        // setenv: HTTP threads must not mutate the process env). outdoorProf
+        // valid = the camera position picks between the two profiles.
+        RigProfile indoorProf, outdoorProf;
+        bool activeOutdoor = false;   // profile the accumulation was built with
         // Wavefront pipeline state owned by the session (design 5.2):
         // buffers and accumulation persist across render chunks; reset
         // when the generation or size changes. Destroying it frees CUDA
@@ -222,6 +229,16 @@ private:
         float warmTint = 1.0f;
         float saturationBoost = 1.0f;
         int bloom = -1;   // -1 = follow the RENDER_BLOOM env default
+        // Position-aware rig profile (resolved at submit from the camera
+        // position; neutral defaults = "follow the startup env / CLI path").
+        // Physical: applied to GPURenderArgs on the GPU worker.
+        float emissionScale = 1.0f, indirectScale = 1.0f;
+        // Display grade: applied to the Photo on the encode thread.
+        float wbStrength = 0.0f;
+        bool splitKeySun = false;
+        float splitWarm = 0.0f, splitCool = 0.0f;
+        std::string gradeBands;   // raw "l,r,g,b ..." (parsed at encode)
+        bool hasProfile = false;  // true = these fields override the env path
     };
 
     // Self-contained preview-encode work item (encode pipeline): filled by
@@ -246,6 +263,13 @@ private:
         float warmTint = 1.0f;
         float saturationBoost = 1.0f;
         int bloom = -1;
+        // Position-aware rig profile carried from the ChunkTask
+        // (hasProfile=false = the encode falls back to the env grade path).
+        float wbStrength = 0.0f;
+        bool splitKeySun = false;
+        float splitWarm = 0.0f, splitCool = 0.0f;
+        std::string gradeBands;
+        bool hasProfile = false;
         std::vector<PerPixelData> output;
     };
 

@@ -135,3 +135,11 @@ private:
     void fxaa();
     void depthOfField(const float* depthBuffer, float focus, float coc);
 };
+
+// Assemble the env-driven display grade (RENDER_WB_STRENGTH, RENDER_SPLIT_*,
+// RENDER_GRADE_BANDS, RENDER_SATURATION) onto a Photo. Shared by the console
+// and the render server so a calibrated rig cannot drift between the CLI and
+// the deployed viewer (the server silently dropped WB/split/grade/saturation
+// before this existed). saturationEnvWins: console always honors the env; the
+// server only when no client value was pinned (session == neutral 1.0).
+void applyRenderGradeEnv(Photo& photo, bool saturationEnvWins);

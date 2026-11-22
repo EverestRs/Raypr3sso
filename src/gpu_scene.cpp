@@ -44,13 +44,13 @@ GPUScene::GeometryData GPUScene::packGeometry(const Model& model) {
 	return result;
 }
 
-std::unique_ptr<GPUScene> GPUScene::load(const Model& model) {
+	std::unique_ptr<GPUScene> GPUScene::load(const Model& model) {
 	auto scene = std::make_unique<GPUScene>();
-	const float emissionScale = [] {
-		if (const char* value = std::getenv("RENDER_EMISSION_SCALE"))
-			return std::strtof(value, nullptr);
-		return 1.0f;
-	}();
+	// RENDER_EMISSION_SCALE moved OFF the load-time bake: a resident scene
+	// (server registry) must render daytime (fixtures ~off) and evening
+	// (fixtures on) views without a reload, so the scale is a per-render
+	// GPURenderArgs knob applied in gpu_shadeBounce. Load stays raw (1.0).
+	const float emissionScale = 1.0f;
 	fprintf(stderr, "  load-stage: packGeometry\n");
 	sceneProgress::report("geometry", 0, 1);
 	GeometryData geometry = packGeometry(model);

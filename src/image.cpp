@@ -851,6 +851,47 @@ void refreshRenderEnv() {
     }
 }
 
+// Shared env->Photo grade assembly (declared in image.h). Mirrors the console
+// block that used to be the only reader of these knobs: the render server now
+// calls the same function, so WB / split-tone / grade bands / saturation
+// behave identically in the CLI and the deployed viewer.
+void applyRenderGradeEnv(Photo& photo, bool saturationEnvWins) {
+    // Von Kries gray-world auto WB strength (RENDER_WB_STRENGTH, 0=off)
+    if (const char* ws = std::getenv("RENDER_WB_STRENGTH"))
+        photo.wbStrength = fmaxf(0.0f, std::strtof(ws, nullptr));
+    // Split-tone (render-time): warm highlights / cool shade, keyed on
+    // the P1 sun matte (RENDER_SPLIT_KEY=sun) or display luma.
+    if (const char* sk = std::getenv("RENDER_SPLIT_KEY"))
+        photo.splitKeySun = (std::string(sk) == "sun");
+    if (const char* sw = std::getenv("RENDER_SPLIT_WARM"))
+        photo.splitWarm = std::strtof(sw, nullptr);
+    if (const char* sc = std::getenv("RENDER_SPLIT_COOL"))
+        photo.splitCool = std::strtof(sc, nullptr);
+    // P4d luma-band grade table (RENDER_GRADE_BANDS, from
+    // scripts/make_lut_grade.py): "l,r,g,b l,r,g,b ...".
+    photo.gradeBands.clear();
+    if (const char* gb = std::getenv("RENDER_GRADE_BANDS")) {
+        std::istringstream ss(gb);
+        std::string tok;
+        while (ss >> tok) {
+            float l, r, g, b;
+            if (std::sscanf(tok.c_str(), "%f,%f,%f,%f", &l, &r, &g, &b) == 4) {
+                photo.gradeBands.push_back(l);
+                photo.gradeBands.push_back(r);
+                photo.gradeBands.push_back(g);
+                photo.gradeBands.push_back(b);
+            }
+        }
+    }
+    // RENDER_SATURATION: display-domain saturation boost. The console always
+    // honors it over the args value; the server only when the session still
+    // carries the neutral 1.0 (no client slider pinned it).
+    if (saturationEnvWins) {
+        if (const char* sb = std::getenv("RENDER_SATURATION"))
+            photo.saturationBoost = fmaxf(0.0f, std::strtof(sb, nullptr));
+    }
+}
+
 void Photo::gammaCorrect() {
     if (!channels.finalColor) return;
     const float invGamma = 1.0f / 2.2f;

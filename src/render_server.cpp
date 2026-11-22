@@ -10,6 +10,7 @@
 #include <fstream>
 #include <iostream>
 #include <sstream>
+#include <cstdio>
 #include <thread>
 #include <vector>
 #include <cmath>
@@ -100,7 +101,7 @@ const ModelSpec kModels[] = {
     {"sphere-test",     "ball",     true,  "",                   "",                   "", ""},
     {"bistro-interior", "interior", false, "models/Bistro_v5_2", "BistroInterior.fbx", "", "null"},
     {"bistro",          "bistro",   false, "models/Bistro_v5_2", "BistroInterior.fbx",
-     "BistroExterior.fbx", "models/Bistro_v5_2/kloppenheim_02_puresky_4k.hdr"},
+     "BistroExterior.fbx", "models/Bistro_v5_2/qwantani_azm55_4k.hdr"},
 };
 
 const ModelSpec* findModelSpec(const std::string& id) {
@@ -324,6 +325,7 @@ std::string RenderServer::createSession(const std::string& body, int& status) {
     float indoorExposure = 0.0f, indoorMargin = 1.5f;
     float indoorMin[3] = {0.0f, 0.0f, 0.0f};
     float indoorMax[3] = {0.0f, 0.0f, 0.0f};
+    RigProfile indoorProf, outdoorProf;
     if (!presetName.empty()) {
         ScenePreset preset;
         if (!findScenePreset(presetName, preset)) {
@@ -342,6 +344,11 @@ std::string RenderServer::createSession(const std::string& body, int& status) {
             indoorMax[a] = preset.indoorMax[a];
         }
         indoorMargin = preset.indoorMargin;
+        // Position-aware rig profiles: PURE DATA parsing of the rig lists
+        // (no setenv — safe on the HTTP thread). submitRender picks one by
+        // camera position and delivers it through the task channel.
+        indoorProf = parseRigProfile(preset.rigEnv);
+        outdoorProf = parseRigProfile(preset.rigEnvOutdoor);
         // NOTE: the preset's lighting/grade RIG is intentionally NOT applied
         // here. applyPresetRig mutates the process environment (setenv),
         // which is not thread-safe against the GPU worker / other HTTP
@@ -391,6 +398,8 @@ std::string RenderServer::createSession(const std::string& body, int& status) {
         session.indoorMin[a] = indoorMin[a];
         session.indoorMax[a] = indoorMax[a];
     }
+    session.indoorProf = std::move(indoorProf);
+    session.outdoorProf = std::move(outdoorProf);
     // No CUDA calls in the constructor: buffers are allocated on first
     // render, on the GPU worker thread.
     session.wavefront = std::make_unique<WavefrontRenderContext>();
@@ -952,6 +961,23 @@ std::string RenderServer::submitRender(const std::string& id, const std::string&
     // re-submits the next chunk until sppBudget is reached (design 4.3).
     // progressive (批1): explicit chunkSpp wins; otherwise the chain uses the
     // geometric plan (2,4,8,16,...) computed per continuation.
+    //
+    // Position-aware rig profile: pick by the EFFECTIVE camera position.
+    // indoor = inside the interior box grown by indoorMargin — the same box
+    // the client's exposure tier blends on. Pure data on the task channel;
+    // no setenv anywhere near this (HTTP thread).
+    const RigProfile* prof = nullptr;
+    if (session.outdoorProf.valid) {
+        const float3& p = session.camera.position;
+        const float m = session.indoorMargin;
+        const bool indoor =
+            p.x >= session.indoorMin[0] - m && p.x <= session.indoorMax[0] + m &&
+            p.y >= session.indoorMin[1] - m && p.y <= session.indoorMax[1] + m &&
+            p.z >= session.indoorMin[2] - m && p.z <= session.indoorMax[2] + m;
+        prof = indoor ? &session.indoorProf : &session.outdoorProf;
+        session.activeOutdoor = !indoor;  // observability; crossing the
+        // boundary is a camera change, which already resets the accumulation
+    }
     ChunkTask task;
     task.sessionId = id;
     task.renderId = "r-" + std::to_string(nextRenderId_++);
@@ -982,6 +1008,35 @@ std::string RenderServer::submitRender(const std::string& id, const std::string&
     task.sunEl = session.sunEl;
     task.sunInt = session.sunInt;
     task.reencode = reencode;
+    if (prof) {
+        task.hasProfile = true;
+        task.emissionScale = prof->emissionScale;
+        task.indirectScale = prof->indirectScale;
+        task.wbStrength = prof->wbStrength;
+        task.splitKeySun = prof->splitKeySun;
+        task.splitWarm = prof->splitWarm;
+        task.splitCool = prof->splitCool;
+        task.gradeBands = prof->gradeBands;
+        // Client-pinned saturation (slider) wins over the profile default.
+        if (session.saturationBoost != 1.0f)
+            task.saturationBoost = session.saturationBoost;
+        else
+            task.saturationBoost = prof->saturationBoost;
+        // Sun: the client's explicit override (session.sunHas, A3) wins;
+        // otherwise the profile arms it.
+        if (!session.sunHas && prof->hasSun) {
+            task.sunHas = true;
+            task.sunAz = prof->sunAz;
+            task.sunEl = prof->sunEl;
+            task.sunInt = prof->sunInt;
+        }
+        // Exposure default when the body sent none: the indoor tier value
+        // for the indoor profile, the outdoor base otherwise. (The browser
+        // client always sends its blended tier exposure, which wins here.)
+        if (exposure <= 0.0f)
+            task.exposure = (prof == &session.indoorProf && session.indoorExposure > 0.0f)
+                          ? session.indoorExposure : session.exposure;
+    }
     auto job = scheduler_.submit(generation, [this, task](const RenderScheduler::Job& job) {
         runRenderChunk(task, job);
     });
@@ -1076,6 +1131,15 @@ void RenderServer::runRenderChunk(const ChunkTask& task, const RenderScheduler::
         } else {
             applySunFromEnv(args);
         }
+        // Physical profile knobs (emission/indirect): task channel when a
+        // position-aware profile drove this render; startup-env fallback
+        // otherwise (CLI-parity for presets without profiles).
+        if (task.hasProfile) {
+            args.emissionScale = task.emissionScale;
+            args.indirectScale = task.indirectScale;
+        } else {
+            applyPhysicalEnvFromEnv(args);
+        }
         std::vector<PerPixelData> output(size_t(task.width) * task.height);
         const bool perfLog = [] {
             const char* p = std::getenv("RENDER_PERF");
@@ -1149,6 +1213,12 @@ void RenderServer::runRenderChunk(const ChunkTask& task, const RenderScheduler::
             job.warmTint = task.warmTint;
             job.saturationBoost = task.saturationBoost;
             job.bloom = task.bloom;
+            job.hasProfile = task.hasProfile;
+            job.wbStrength = task.wbStrength;
+            job.splitKeySun = task.splitKeySun;
+            job.splitWarm = task.splitWarm;
+            job.splitCool = task.splitCool;
+            job.gradeBands = task.gradeBands;
             job.output = std::move(output);
             enqueueEncode(std::move(job));
         }
@@ -1227,12 +1297,45 @@ void RenderServer::encodePreview(const EncodeJob& job) {
     photo.exposure = job.exposure;
     photo.warmTint = job.warmTint;
     photo.saturationBoost = job.saturationBoost;
+    // Display grade: position-aware profiles deliver WB / split-tone /
+    // grade bands / saturation as task data (parsed at session creation —
+    // no setenv on this thread either); sessions without a profile keep
+    // the shared env path (CLI parity).
+    if (job.hasProfile) {
+        photo.wbStrength = job.wbStrength;
+        photo.splitKeySun = job.splitKeySun;
+        photo.splitWarm = job.splitWarm;
+        photo.splitCool = job.splitCool;
+        photo.gradeBands.clear();
+        {
+            std::istringstream gbs(job.gradeBands);
+            std::string tok;
+            while (gbs >> tok) {
+                float l, r, g, b;
+                if (std::sscanf(tok.c_str(), "%f,%f,%f,%f", &l, &r, &g, &b) == 4) {
+                    photo.gradeBands.push_back(l);
+                    photo.gradeBands.push_back(r);
+                    photo.gradeBands.push_back(g);
+                    photo.gradeBands.push_back(b);
+                }
+            }
+        }
+        // photo.saturationBoost was set from job.saturationBoost above —
+        // the profile/client precedence was already resolved at submit.
+    } else {
+        // Shared env grade assembly (WB / split-tone / grade bands /
+        // RENDER_SATURATION) — identical to the console path. The
+        // saturation env only wins when the session still carries the
+        // neutral 1.0 (no client slider pinned it).
+        applyRenderGradeEnv(photo, job.saturationBoost == 1.0f);
+    }
 
     // 精修链降噪（设计 9）：与 console 完全同源的 radiance/G-buffer 填充，
     // 让预览走同一条 NL-means 降噪路径——否则低 spp 的无降噪预览只剩
     // 高光轮廓（实测反馈）。
     std::vector<RadianceData> radD, radS, radI, radIs;
     std::vector<HitInfo> gbuffer;
+    std::vector<float> sunMask(job.output.size());  // P1 grade matte (split-tone key)
     if (job.denoise) {
         const size_t n = job.output.size();
         radD.resize(n); radS.resize(n); radI.resize(n); radIs.resize(n);
@@ -1245,6 +1348,7 @@ void RenderServer::encodePreview(const EncodeJob& job) {
                                 + ppd.radiance_Id + ppd.radiance_Is
                                 + ppd.emission;
         photo.channels.finalColor[i] = float4(finalColor, 1.0f);
+        sunMask[i] = ppd.sunMask;
         if (job.denoise) {
             radD[i].radiance = ppd.radiance_Dd; radD[i].Var = ppd.var_Dd;
             radS[i].radiance = ppd.radiance_Ds; radS[i].Var = ppd.var_Ds;
@@ -1267,6 +1371,7 @@ void RenderServer::encodePreview(const EncodeJob& job) {
         photo.radiance_Is = radIs.data();
         photo.Gbuffer     = gbuffer.data();
     }
+    photo.sunMask = sunMask.data();
     // Bloom follows the console knob (RENDER_BLOOM=0 disables) unless the
     // request pinned it (display-only A1): bright daylight scenes want it
     // off — the Clum>=1 threshold fires on the sunlit street itself and the

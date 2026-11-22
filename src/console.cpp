@@ -251,10 +251,11 @@ void Console::run() {
                 auto& texC = textureData.channels;
                 auto& texD = textureData.data;
 
-                // Second pass: build the material buffer arrays
-                float emiScale = 1.0f;
-                if (const char* es = std::getenv("RENDER_EMISSION_SCALE"))
-                    emiScale = std::strtof(es, nullptr);
+                // Second pass: build the material buffer arrays.
+                // Emission scale moved to per-render args
+                // (applyPhysicalEnvFromEnv); the upload stays raw so the
+                // same resident scene can switch profiles per view.
+                const float emiScale = 1.0f;
                 GPUScene::MaterialData materialData =
                     GPUScene::createMaterialData(model, textureData, emiScale);
                 auto& bcF = materialData.baseColorFactors;
@@ -428,12 +429,10 @@ void Console::run() {
                 // P4b: exact sRGB EOTF for baseColor textures (default pow2.2)
                 if (const char* sr = std::getenv("RENDER_SRGB_EXACT"))
                     setSrgbExact(std::atoi(sr) != 0);
-                // GI bounce energy scale (RENDER_INDIRECT_SCALE, default 1.0):
-                // scales all depth>0 radiance contributions. The official
-                // exterior rig carries less interreflection — dial down with
-                // SKY_SCALE up for the weak-bounce/blue-fill look.
-                if (const char* is = std::getenv("RENDER_INDIRECT_SCALE"))
-                    gpuArgs.indirectScale = fmaxf(0.0f, std::strtof(is, nullptr));
+                // GI bounce energy scale + emissive scale
+                // (RENDER_INDIRECT_SCALE / RENDER_EMISSION_SCALE) — shared
+                // assembly with the render server's non-profile path.
+                applyPhysicalEnvFromEnv(gpuArgs);
 
                 // Adaptive per-pixel sampling (自适应逐像素, RENDER_ADAPTIVE_*):
                 // spp becomes the budget; pixels stop once all AOV channels'
@@ -627,41 +626,10 @@ void Console::run() {
 
             // Post-process and save (with denoising)
             photo.warmTint = args.warmTint;
-            // Von Kries gray-world auto WB strength (RENDER_WB_STRENGTH, 0=off)
-            if (const char* ws = std::getenv("RENDER_WB_STRENGTH"))
-                photo.wbStrength = fmaxf(0.0f, std::strtof(ws, nullptr));
-            // Split-tone (render-time): warm highlights / cool shade, keyed on
-            // the P1 sun matte (RENDER_SPLIT_KEY=sun) or display luma.
-            {
-                if (const char* sk = std::getenv("RENDER_SPLIT_KEY"))
-                    photo.splitKeySun = (std::string(sk) == "sun");
-                if (const char* sw2 = std::getenv("RENDER_SPLIT_WARM"))
-                    photo.splitWarm = std::strtof(sw2, nullptr);
-                if (const char* sc2 = std::getenv("RENDER_SPLIT_COOL"))
-                    photo.splitCool = std::strtof(sc2, nullptr);
-            }
-            // P4d luma-band grade table (RENDER_GRADE_BANDS, from
-            // scripts/make_lut_grade.py): "l,r,g,b l,r,g,b ...".
-            photo.gradeBands.clear();
-            if (const char* gb = std::getenv("RENDER_GRADE_BANDS")) {
-                std::istringstream ss(gb);
-                std::string tok;
-                while (ss >> tok) {
-                    float l, r, g, b;
-                    if (std::sscanf(tok.c_str(), "%f,%f,%f,%f", &l, &r, &g, &b) == 4) {
-                        photo.gradeBands.push_back(l);
-                        photo.gradeBands.push_back(r);
-                        photo.gradeBands.push_back(g);
-                        photo.gradeBands.push_back(b);
-                    }
-                }
-            }
             photo.saturationBoost = args.saturationBoost;
-            // RENDER_SATURATION: env override for the saturation boost (the
-            // daylight exterior needs it — gray-world WB + a pale sky wash
-            // the awning's deep red out; official awning R:G is 2.3:1).
-            if (const char* sb = std::getenv("RENDER_SATURATION"))
-                photo.saturationBoost = fmaxf(0.0f, std::strtof(sb, nullptr));
+            // WB / split-tone / grade bands / RENDER_SATURATION env override —
+            // shared with the render server (see image.h).
+            applyRenderGradeEnv(photo, true);
             // RENDER_DENOISE=0 disables the denoiser for A/B diagnostics
             const char* denoiseEnv = std::getenv("RENDER_DENOISE");
             bool doDenoise = !denoiseEnv || denoiseEnv[0] != '0';

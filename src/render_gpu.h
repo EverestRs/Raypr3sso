@@ -62,6 +62,14 @@ struct GPURenderArgs {
     // for the weak-bounce/blue-fill look.
     float indirectScale = 1.0f;
 
+    // Emissive energy scale (RENDER_EMISSION_SCALE / position-aware rig
+    // profiles): multiplies surface emission factors and light-object
+    // radiance at shading time. Moved OFF the load-time material bake so a
+    // resident scene can render daytime (fixtures ~off) and evening
+    // (fixtures on) views without a reload. 1.0 = unbiased default; applied
+    // in gpu_shadeBounce at the two emission consumption points.
+    float emissionScale = 1.0f;
+
     // NEE samples per rough-surface hit (设计 17 的 NEE K). 0 = resolve to
     // the process default (RENDER_NEE_K via setNeeK, else 4) at render
     // entry; kernels only ever read the resolved args value, so a server
@@ -277,6 +285,10 @@ int defaultNeeK();
 // 一致——服务端此前从未设置 hasSun，Bistro 内景缺主直接光导致整体死黑）。
 // 返回是否启用了太阳。
 bool applySunFromEnv(GPURenderArgs& args);
+// Per-render physical env knobs (RENDER_INDIRECT_SCALE / RENDER_EMISSION_SCALE)
+// assembled from the process env — the CLI/startup-rig path. The server's
+// position-aware profiles deliver these via the task instead.
+void applyPhysicalEnvFromEnv(GPURenderArgs& args);
 // 显式参数版（render server /render 的 sunAz/sunEl/sunInt）：方向来自
 // az/el，radiance = inten × RENDER_SUN_TINT，soft/cone-kill 仍跟随 env——
 // 与 env rig 同观感。inten<=0 时直接返回 false（关太阳）。
