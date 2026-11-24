@@ -1,5 +1,6 @@
-# ---- 构建产物 ----
+# ---- 构建产物（build/ 常规开发，build-ci/ 供 scripts/ci.sh）----
 build/
+build-ci/
 
 # ---- 场景资产（~1.8GB）：从 NVIDIA ORCA 下载，见 README"可用模型" ----
 models/

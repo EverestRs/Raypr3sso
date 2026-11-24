@@ -1,0 +1,55 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  # Compile the full CUDA tree and verify the CPU backend is deterministic.
+  # Hosted runners have no GPU, so GPU assertions live in build-gpu below.
+  build-cpu:
+    runs-on: ubuntu-24.04
+    # CUDA 12.6 keeps sm_70 (V100) support; the renderer's default arch is 70.
+    container: nvidia/cuda:12.6.3-devel-ubuntu22.04
+    steps:
+      - name: Install git in container
+        run: |
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            ca-certificates git
+      - uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            cmake g++ libassimp-dev curl clang-format
+
+      - name: Format check (files added since base)
+        continue-on-error: true
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+        run: scripts/ci/format_check.sh "${BASE_SHA:-}"
+
+      - name: Build + CPU smoke
+        run: BUILD_DIR=build-ci scripts/ci.sh --no-gpu
+
+      - name: Upload build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          path: build-ci/build.log
+          if-no-files-found: ignore
+
+  # GPU assertions need a real device. Runs on a self-hosted runner labelled
+  # `gpu` (this is the V100 machine) and is manual-dispatch to avoid queuing
+  # forever on forks/PRs without such a runner.
+  build-gpu:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: [self-hosted, linux, gpu]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build + GPU determinism + byte A/B
+        run: BUILD_DIR=build-ci scripts/ci.sh --require-gpu --ab

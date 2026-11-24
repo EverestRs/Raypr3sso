@@ -1,0 +1,23 @@
+# Formatting rules for new code only. The existing tree predates this file
+# and is grandfathered: scripts/ci/format_check.sh checks files ADDED since
+# the base ref, and touched legacy files can be formatted opportunistically.
+BasedOnStyle: LLVM
+Language: Cpp
+Standard: c++17
+IndentWidth: 4
+TabWidth: 4
+UseTab: Never
+ColumnLimit: 100
+BreakBeforeBraces: Attach
+AllowShortFunctionsOnASingleLine: Empty
+AllowShortIfStatementsOnASingleLine: Never
+AllowShortLoopsOnASingleLine: false
+PointerAlignment: Left
+ReferenceAlignment: Left
+DerivePointerAlignment: false
+SortIncludes: Never
+IncludeBlocks: Preserve
+SpaceAfterCStyleCast: false
+Cpp11BracedListStyle: true
+BinPackArguments: true
+BinPackParameters: true
