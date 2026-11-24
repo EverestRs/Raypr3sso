@@ -944,56 +944,54 @@ bool gpuPostEnabled() {
     return cudaGetDeviceCount(&ndev) == cudaSuccess && ndev > 0;
 }
 
-bool postProcessGPU(Photo& photo, int shadeOptions, int spp, int denoiseQuality) {
-    if (!layoutOk()) {
-        fprintf(stderr, "POSTGPU: host/device layout mismatch — CPU fallback\n");
-        return false;
-    }
-    if (!photo.channels.finalColor || photo.width <= 0 || photo.height <= 0 ||
-        !photo.radiance_Dd || !photo.radiance_Ds || !photo.radiance_Id ||
-        !photo.radiance_Is || !photo.Gbuffer)
-        return false;
+// ---------------------------------------------------------------------------
+// postProcessGPU stages. Pure extraction from the former single-function body:
+// same allocation order, same kernels, same host-side statistics, same stderr
+// diagnostics. Each helper returns false on allocation/launch failure and the
+// caller falls back to the CPU post-process.
+// ---------------------------------------------------------------------------
+namespace {
 
-    const int width = photo.width, height = photo.height;
-    const size_t n = size_t(width) * height;
-    const auto t0 = std::chrono::steady_clock::now();
-    auto msOf = [](const std::chrono::steady_clock::time_point& a,
-                   const std::chrono::steady_clock::time_point& b) {
-        return std::chrono::duration<float, std::milli>(b - a).count();
-    };
+struct GpuPostCtx {
+    int    width = 0, height = 0;
+    size_t n = 0;
+    int    sppEff = 0;
+    bool   hasEmission = false;
+    bool   hasSunMask = false;
 
-    cudaDeviceProp prop{};
-    int devId = 0;
-    cudaGetDevice(&devId);
-    cudaGetDeviceProperties(&prop, devId);
-    fprintf(stderr, "POSTGPU: %dx%d on %s (statistics-equivalent path, NOT byte-identical)\n",
-            width, height, prop.name);
-    fflush(stderr);
-
-    // RENDER_SPP backdoor (same as the CPU path).
-    int sppEff = spp;
-    if (const char* e = std::getenv("RENDER_SPP")) {
-        const long v = std::strtol(e, nullptr, 10);
-        if (v > 0) sppEff = (int)v;
-    }
-
-    // ---- device buffers ----
     DevBuf aDd, aDs, aId, aIs, gbuf, emission, sunMaskD, finalG;
     DevBuf temp, Lm, lumLin, radBuf, varBuf, varEst, lumF;
     DevBuf oidnG, colorG, albedoG, normalG, sunlinessG;
     DevBuf aoG, albBlurG, bloomColor, bloomTemp, scratch4;
     DevBuf wbPartial, lumReducePartial;
-    if (!aDd.alloc(n * 16) || !aDs.alloc(n * 16) || !aId.alloc(n * 16) ||
-        !aIs.alloc(n * 16) || !gbuf.alloc(n * sizeof(GbufG)) ||
-        !finalG.alloc(n * 16))
+
+    RadG* A[4] = {nullptr, nullptr, nullptr, nullptr};
+    const GbufG* G = nullptr;
+    float4* EM = nullptr;
+
+    // sunlinessG is allocated with the upload stage but only WRITTEN inside
+    // the denoise block (same scope as the CPU path). kGamma must key the
+    // split-tone on this flag, not on pointer non-nullness — with DoDenoise
+    // off the buffer holds cudaMalloc garbage and the CPU path falls back to
+    // the luma key (photo.sunliness empty), so a null-check alone would read
+    // uninitialized device memory and diverge.
+    bool  sunlinessReady = false;
+    bool  denoised = false;
+    float lumScale = 1.0f, rawLumMean = 0.0f;
+};
+
+// ---- pack + upload (H2D) ----
+bool gpuPostUpload(Photo& photo, GpuPostCtx& ctx) {
+    const size_t n = ctx.n;
+    if (!ctx.aDd.alloc(n * 16) || !ctx.aDs.alloc(n * 16) || !ctx.aId.alloc(n * 16) ||
+        !ctx.aIs.alloc(n * 16) || !ctx.gbuf.alloc(n * sizeof(GbufG)) ||
+        !ctx.finalG.alloc(n * 16))
         return false;
 
-    // ---- pack + upload (H2D) ----
-    const auto tUp0 = std::chrono::steady_clock::now();
-    CUDA_CHECK(cudaMemcpy(aDd.p, photo.radiance_Dd, n * 16, cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(aDs.p, photo.radiance_Ds, n * 16, cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(aId.p, photo.radiance_Id, n * 16, cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(aIs.p, photo.radiance_Is, n * 16, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(ctx.aDd.p, photo.radiance_Dd, n * 16, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(ctx.aDs.p, photo.radiance_Ds, n * 16, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(ctx.aId.p, photo.radiance_Id, n * 16, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(ctx.aIs.p, photo.radiance_Is, n * 16, cudaMemcpyHostToDevice));
     {
         std::vector<GbufG> g(n);
         const HitInfo* GB = photo.Gbuffer;
@@ -1005,490 +1003,612 @@ bool postProcessGPU(Photo& photo, int shadeOptions, int spp, int denoiseQuality)
             g[i].roughness = GB[i].roughness; g[i].metallic = GB[i].metallic;
             g[i].specular  = GB[i].specular;  g[i].opacity  = GB[i].opacity;
         }
-        CUDA_CHECK(cudaMemcpy(gbuf.p, g.data(), n * sizeof(GbufG), cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(ctx.gbuf.p, g.data(), n * sizeof(GbufG), cudaMemcpyHostToDevice));
     }
-    const bool hasEmission = photo.channels.emission != nullptr;
-    if (hasEmission) {
-        if (!emission.alloc(n * 16)) return false;
-        CUDA_CHECK(cudaMemcpy(emission.p, photo.channels.emission, n * 16,
+    ctx.hasEmission = photo.channels.emission != nullptr;
+    if (ctx.hasEmission) {
+        if (!ctx.emission.alloc(n * 16)) return false;
+        CUDA_CHECK(cudaMemcpy(ctx.emission.p, photo.channels.emission, n * 16,
                               cudaMemcpyHostToDevice));
     }
-    const bool hasSunMask = photo.splitKeySun && photo.sunMask != nullptr;
-    if (hasSunMask) {
-        if (!sunMaskD.alloc(n * 4) || !sunlinessG.alloc(n * 4)) return false;
-        CUDA_CHECK(cudaMemcpy(sunMaskD.p, photo.sunMask, n * 4, cudaMemcpyHostToDevice));
+    ctx.hasSunMask = photo.splitKeySun && photo.sunMask != nullptr;
+    if (ctx.hasSunMask) {
+        if (!ctx.sunMaskD.alloc(n * 4) || !ctx.sunlinessG.alloc(n * 4)) return false;
+        CUDA_CHECK(cudaMemcpy(ctx.sunMaskD.p, photo.sunMask, n * 4, cudaMemcpyHostToDevice));
     }
-    CUDA_CHECK(cudaMemcpy(finalG.p, photo.channels.finalColor, n * 16,
+    CUDA_CHECK(cudaMemcpy(ctx.finalG.p, photo.channels.finalColor, n * 16,
                           cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaDeviceSynchronize());
-    const double upMs = msOf(tUp0, std::chrono::steady_clock::now());
 
-    RadG* A[4] = { (RadG*)aDd.p, (RadG*)aDs.p, (RadG*)aId.p, (RadG*)aIs.p };
-    const GbufG* G = (const GbufG*)gbuf.p;
-    float4* EM = (float4*)(hasEmission ? emission.p : nullptr);
-    // sunlinessG is allocated with the upload stage but only WRITTEN inside
-    // the denoise block (same scope as the CPU path). kGamma must key the
-    // split-tone on this flag, not on pointer non-nullness — with DoDenoise
-    // off the buffer holds cudaMalloc garbage and the CPU path falls back to
-    // the luma key (photo.sunliness empty), so a null-check alone would read
-    // uninitialized device memory and diverge.
-    bool sunlinessReady = false;
+    ctx.A[0] = (RadG*)ctx.aDd.p;
+    ctx.A[1] = (RadG*)ctx.aDs.p;
+    ctx.A[2] = (RadG*)ctx.aId.p;
+    ctx.A[3] = (RadG*)ctx.aIs.p;
+    ctx.G = (const GbufG*)ctx.gbuf.p;
+    ctx.EM = (float4*)(ctx.hasEmission ? ctx.emission.p : nullptr);
+    return true;
+}
 
-    bool denoised = false;
-    float lumScale = 1.0f, rawLumMean = 0.0f;
-    const auto tDn0 = std::chrono::steady_clock::now();
+// ---- robust statistics: lumScale (1/7 median) + rawLumMean, and the
+// ---- relative firefly clamp (per AOV, 1/13 p99.9)
+bool gpuDenoiseStats(GpuPostCtx& ctx, float& kSppOut, float& ffGateOut) {
+    const size_t n = ctx.n;
+    const unsigned nS7  = ceilDiv(n, 7);
+    const unsigned nS13 = ceilDiv(n, 13);
+    RadG** A = ctx.A;
 
-    // ======================= denoise block =======================
-    if (shadeOptions & Photo::DoDenoise) {
-        const unsigned nS7  = ceilDiv(n, 7);
-        const unsigned nS13 = ceilDiv(n, 13);
-        const unsigned nS4  = ceilDiv(n, 4);
+    {
+        if (!ctx.lumReducePartial.alloc(ceilDiv(n, TPB) * sizeof(float3))) return false;
+        kLumReduce<<<ceilDiv(n, TPB), TPB>>>(A[0], A[1], A[2], A[3],
+                                             (int)n, (float3*)ctx.lumReducePartial.p);
+        std::vector<float3> parts(ceilDiv(n, TPB));
+        CUDA_CHECK(cudaMemcpy(parts.data(), ctx.lumReducePartial.p,
+                              parts.size() * sizeof(float3), cudaMemcpyDeviceToHost));
+        double s = 0.0;
+        for (const float3& p : parts) s += double(p.x);
+        ctx.rawLumMean = float(s / double(n));
+    }
+    {
+        DevBuf samp;
+        if (!samp.alloc(size_t(nS7) * 4)) return false;
+        kCompositeLumSample<<<ceilDiv(nS7, TPB), TPB>>>(
+            A[0], A[1], A[2], A[3], (int)n, 7, (float*)samp.p);
+        std::vector<float> s(nS7);
+        CUDA_CHECK(cudaMemcpy(s.data(), samp.p, size_t(nS7) * 4,
+                              cudaMemcpyDeviceToHost));
+        std::nth_element(s.begin(), s.begin() + s.size() / 2, s.end());
+        ctx.lumScale = fmaxf(s[s.size() / 2], 1e-6f);
+    }
+    if (ctx.lumScale <= ctx.rawLumMean / 16.0f)
+        ctx.lumScale = ctx.rawLumMean / 8.0f;
 
-        // ---- robust statistics: lumScale (1/7 median) + rawLumMean ----
-        {
-            if (!lumReducePartial.alloc(ceilDiv(n, TPB) * sizeof(float3))) return false;
-            kLumReduce<<<ceilDiv(n, TPB), TPB>>>(A[0], A[1], A[2], A[3],
-                                                 (int)n, (float3*)lumReducePartial.p);
-            std::vector<float3> parts(ceilDiv(n, TPB));
-            CUDA_CHECK(cudaMemcpy(parts.data(), lumReducePartial.p,
-                                  parts.size() * sizeof(float3), cudaMemcpyDeviceToHost));
-            double s = 0.0;
-            for (const float3& p : parts) s += double(p.x);
-            rawLumMean = float(s / double(n));
-        }
-        {
-            DevBuf samp;
-            if (!samp.alloc(size_t(nS7) * 4)) return false;
-            kCompositeLumSample<<<ceilDiv(nS7, TPB), TPB>>>(
-                A[0], A[1], A[2], A[3], (int)n, 7, (float*)samp.p);
-            std::vector<float> s(nS7);
-            CUDA_CHECK(cudaMemcpy(s.data(), samp.p, size_t(nS7) * 4,
-                                  cudaMemcpyDeviceToHost));
-            std::nth_element(s.begin(), s.begin() + s.size() / 2, s.end());
-            lumScale = fmaxf(s[s.size() / 2], 1e-6f);
-        }
-        if (lumScale <= rawLumMean / 16.0f)
-            lumScale = rawLumMean / 8.0f;
+    for (int c = 0; c < 4; ++c) {
+        DevBuf samp;
+        if (!samp.alloc(size_t(nS13) * 4)) return false;
+        kSampleLum1<<<ceilDiv(nS13, TPB), TPB>>>(A[c], (int)n, 13,
+                                                 (float*)samp.p);
+        std::vector<float> s(nS13);
+        CUDA_CHECK(cudaMemcpy(s.data(), samp.p, size_t(nS13) * 4,
+                              cudaMemcpyDeviceToHost));
+        std::nth_element(s.begin(),
+                         s.begin() + ptrdiff_t(s.size() * 999 / 1000),
+                         s.end());
+        const float p999 = s[size_t(s.size() * 999 / 1000)];
+        kSpatialClamp<<<ceilDiv(n, TPB), TPB>>>(A[c], (int)n,
+                                                fmaxf(20.0f, 8.0f * p999));
+    }
 
-        // ---- relative firefly clamp (per AOV, 1/13 p99.9) ----
-        for (int c = 0; c < 4; ++c) {
-            DevBuf samp;
-            if (!samp.alloc(size_t(nS13) * 4)) return false;
-            kSampleLum1<<<ceilDiv(nS13, TPB), TPB>>>(A[c], (int)n, 13,
-                                                     (float*)samp.p);
-            std::vector<float> s(nS13);
-            CUDA_CHECK(cudaMemcpy(s.data(), samp.p, size_t(nS13) * 4,
-                                  cudaMemcpyDeviceToHost));
-            std::nth_element(s.begin(),
-                             s.begin() + ptrdiff_t(s.size() * 999 / 1000),
-                             s.end());
-            const float p999 = s[size_t(s.size() * 999 / 1000)];
-            kSpatialClamp<<<ceilDiv(n, TPB), TPB>>>(A[c], (int)n,
-                                                    fmaxf(20.0f, 8.0f * p999));
-        }
+    // ---- SPP-adaptive tolerance ----
+    static constexpr float SPP_REF = 320.0f;
+    float kSpp = std::sqrt(SPP_REF / fmaxf(float(ctx.sppEff), 1.0f));
+    kSpp = std::min(8.0f, std::max(1.0f, kSpp));
+    kSppOut = kSpp;
+    ffGateOut = 6.0f * kSpp;
+    return true;
+}
 
-        // ---- SPP-adaptive tolerance ----
-        static constexpr float SPP_REF = 320.0f;
-        float kSpp = std::sqrt(SPP_REF / fmaxf(float(sppEff), 1.0f));
-        kSpp = std::min(8.0f, std::max(1.0f, kSpp));
-        const float ffGate = 6.0f * kSpp;
+// ---- sun matte (sun-keyed split-tone) ----
+bool gpuSunMatte(GpuPostCtx& ctx) {
+    const size_t n = ctx.n;
+    if (ctx.hasSunMask) {
+        DevBuf mb;
+        if (!mb.alloc(n * 4)) return false;
+        kSunlinessBlur<<<ceilDiv(n, TPB), TPB>>>((const float*)ctx.sunMaskD.p,
+                                                 ctx.width, ctx.height, (float*)mb.p);
+        kSunlinessNorm<<<ceilDiv(n, TPB), TPB>>>(
+            (const float*)mb.p, ctx.A[0], ctx.A[1], ctx.A[2], ctx.A[3], ctx.EM,
+            (int)n, (float*)ctx.sunlinessG.p);
+        ctx.sunlinessReady = true;
+    }
+    return true;
+}
 
-        // ---- sun matte (sun-keyed split-tone) ----
-        if (hasSunMask) {
-            DevBuf mb;
-            if (!mb.alloc(n * 4)) return false;
-            kSunlinessBlur<<<ceilDiv(n, TPB), TPB>>>((const float*)sunMaskD.p,
-                                                     width, height, (float*)mb.p);
-            kSunlinessNorm<<<ceilDiv(n, TPB), TPB>>>(
-                (const float*)mb.p, A[0], A[1], A[2], A[3], EM, (int)n,
-                (float*)sunlinessG.p);
-            sunlinessReady = true;
-        }
-
-        // ---- OIDN (RENDER_OIDN=1, quality >= 2) ----
-        bool oidnHostOk = false;
+// ---- OIDN (RENDER_OIDN=1, quality >= 2) ----
+bool gpuOidn(Photo& photo, GpuPostCtx& ctx, int denoiseQuality, bool& oidnHostOk) {
+    oidnHostOk = false;
 #ifdef RENDERER_HAS_OIDN
-        {
-            const bool oidnOn = envFlag1("RENDER_OIDN");
-            if (oidnOn && denoiseQuality >= 2) {
-                if (!colorG.alloc(n * 12) || !albedoG.alloc(n * 12) ||
-                    !normalG.alloc(n * 12))
-                    return false;
-                kOIDNPack<<<ceilDiv(n, TPB), TPB>>>(
-                    A[0], A[1], A[2], A[3], EM, G, (int)n,
-                    (float*)colorG.p, (float*)albedoG.p, (float*)normalG.p);
-                std::vector<float> color(n * 3), albedo(n * 3), normal(n * 3), out(n * 3);
-                CUDA_CHECK(cudaMemcpy(color.data(),  colorG.p,  n * 12, cudaMemcpyDeviceToHost));
-                CUDA_CHECK(cudaMemcpy(albedo.data(), albedoG.p, n * 12, cudaMemcpyDeviceToHost));
-                CUDA_CHECK(cudaMemcpy(normal.data(), normalG.p, n * 12, cudaMemcpyDeviceToHost));
-                oidnHostOk = oidnRunRT(color, albedo, normal, out, width, height);
-                if (oidnHostOk) {
-                    photo.oidnColor = out;
-                    if (!oidnG.alloc(n * 12)) return false;
-                    CUDA_CHECK(cudaMemcpy(oidnG.p, out.data(), n * 12,
-                                          cudaMemcpyHostToDevice));
-                    fprintf(stderr, "OIDN: denoised %dx%d (RT filter, albedo+normal guides)\n",
-                            width, height);
-                }
-                fflush(stderr);
-            }
+    const size_t n = ctx.n;
+    const bool oidnOn = envFlag1("RENDER_OIDN");
+    if (oidnOn && denoiseQuality >= 2) {
+        if (!ctx.colorG.alloc(n * 12) || !ctx.albedoG.alloc(n * 12) ||
+            !ctx.normalG.alloc(n * 12))
+            return false;
+        kOIDNPack<<<ceilDiv(n, TPB), TPB>>>(
+            ctx.A[0], ctx.A[1], ctx.A[2], ctx.A[3], ctx.EM, ctx.G, (int)n,
+            (float*)ctx.colorG.p, (float*)ctx.albedoG.p, (float*)ctx.normalG.p);
+        std::vector<float> color(n * 3), albedo(n * 3), normal(n * 3), out(n * 3);
+        CUDA_CHECK(cudaMemcpy(color.data(),  ctx.colorG.p,  n * 12, cudaMemcpyDeviceToHost));
+        CUDA_CHECK(cudaMemcpy(albedo.data(), ctx.albedoG.p, n * 12, cudaMemcpyDeviceToHost));
+        CUDA_CHECK(cudaMemcpy(normal.data(), ctx.normalG.p, n * 12, cudaMemcpyDeviceToHost));
+        oidnHostOk = oidnRunRT(color, albedo, normal, out, ctx.width, ctx.height);
+        if (oidnHostOk) {
+            photo.oidnColor = out;
+            if (!ctx.oidnG.alloc(n * 12)) return false;
+            CUDA_CHECK(cudaMemcpy(ctx.oidnG.p, out.data(), n * 12,
+                                  cudaMemcpyHostToDevice));
+            fprintf(stderr, "OIDN: denoised %dx%d (RT filter, albedo+normal guides)\n",
+                    ctx.width, ctx.height);
         }
+        fflush(stderr);
+    }
+#else
+    (void)photo; (void)ctx; (void)denoiseQuality;
 #endif
-        const bool oidnUsed = denoiseQuality >= 3 && oidnHostOk &&
-                              photo.oidnColor.size() == n * 3;
-        const bool nlMeans = !oidnUsed;
-        const int nlPasses = !nlMeans ? 0
-                           : (denoiseQuality == 1 ? 1 : FILTER_PASSES + 2);
-        const float noiseTarget = getDenoiseNoiseTarget();
+    return true;
+}
 
-        if (nlMeans) {
-            // Tier 0: TRUE MC variance snapshot (before filterVar replaces it)
-            DevBuf mc[4];
-            if (!mc[0].alloc(n * 4) || !mc[1].alloc(n * 4) ||
-                !mc[2].alloc(n * 4) || !mc[3].alloc(n * 4)) return false;
-            for (int c = 0; c < 4; ++c)
-                kSnapshotMcVar<<<ceilDiv(n, TPB), TPB>>>(A[c], (float*)mc[c].p,
-                                                         (int)n);
+// ---- NL-means multi-scale ladder ----
+bool gpuNlMeans(GpuPostCtx& ctx, int nlPasses, float noiseTarget, float ffGate,
+                int denoiseQuality) {
+    const size_t n = ctx.n;
+    const unsigned nS7 = ceilDiv(n, 7);
+    RadG** A = ctx.A;
 
-            // Tier 1: filterVar + pre-firefly clamp
-            if (!varEst.alloc(n * 4)) return false;
-            fprintf(stderr, "DENOISE start\n"); fflush(stderr);
-            for (int c = 0; c < 4; ++c) {
-                kFilterVar<<<ceilDiv(n, TPB), TPB>>>(A[c], width, height,
-                                                     (float*)varEst.p);
-                kAssignVar<<<ceilDiv(n, TPB), TPB>>>(A[c], (const float*)varEst.p,
-                                                     (int)n);
-            }
-            if (!lumF.alloc(n * 4)) return false;
-            for (int c = 0; c < 4; ++c) {
-                kLumField<<<ceilDiv(n, TPB), TPB>>>(A[c], (int)n, (float*)lumF.p);
-                kFireflyClamp<<<ceilDiv(n, TPB), TPB>>>(A[c], (const float*)lumF.p,
-                                                        width, height, ffGate);
-            }
+    // Tier 0: TRUE MC variance snapshot (before filterVar replaces it)
+    DevBuf mc[4];
+    if (!mc[0].alloc(n * 4) || !mc[1].alloc(n * 4) ||
+        !mc[2].alloc(n * 4) || !mc[3].alloc(n * 4)) return false;
+    for (int c = 0; c < 4; ++c)
+        kSnapshotMcVar<<<ceilDiv(n, TPB), TPB>>>(A[c], (float*)mc[c].p,
+                                                 (int)n);
 
-            // Normalize to median composite luminance 1.0
-            const float invScale = 1.0f / lumScale;
-            for (int c = 0; c < 4; ++c)
-                kScaleAov<<<ceilDiv(n, TPB), TPB>>>(A[c], (int)n, invScale);
-            for (int c = 0; c < 4; ++c)
-                kScaleMcVar<<<ceilDiv(n, TPB), TPB>>>((float*)mc[c].p, (int)n,
-                                                      invScale * invScale);
-
-            // Per-AOV median Var (1/7 samples, host median — same stride)
-            float varMed[4] = {1.0f, 1.0f, 1.0f, 1.0f};
-            for (int c = 0; c < 4; ++c) {
-                DevBuf samp;
-                if (!samp.alloc(size_t(nS7) * 4)) return false;
-                kSampleVar<<<ceilDiv(nS7, TPB), TPB>>>(A[c], (int)n, 7,
-                                                       (float*)samp.p);
-                std::vector<float> s(nS7);
-                CUDA_CHECK(cudaMemcpy(s.data(), samp.p, size_t(nS7) * 4,
-                                      cudaMemcpyDeviceToHost));
-                std::nth_element(s.begin(), s.begin() + s.size() / 2, s.end());
-                varMed[c] = fmaxf(s[s.size() / 2], 1e-12f);
-            }
-
-            // Multi-scale ladder — the same 5x5 log-domain filter as the CPU.
-            if (!temp.alloc(n * 16) || !Lm.alloc(n * 12) || !lumLin.alloc(n * 4) ||
-                !radBuf.alloc(n * 12) || !varBuf.alloc(n * 4))
-                return false;
-            const bool spec[4] = {false, true, false, true};
-            for (int pass = 0; pass < nlPasses; ++pass) {
-                for (int c = 0; c < 4; ++c) {
-                    kLogTemp<<<ceilDiv(n, TPB), TPB>>>(A[c], (int)n,
-                                                       (RadG*)temp.p);
-                    kLm<<<ceilDiv(n, TPB), TPB>>>((const RadG*)temp.p, width,
-                                                  height, (float3*)Lm.p);
-                    kLumLin<<<ceilDiv(n, TPB), TPB>>>(A[c], (int)n,
-                                                      (float*)lumLin.p);
-                    kFilterMain<<<ceilDiv(n, TPB), TPB>>>(
-                        (const RadG*)temp.p, G, (const float3*)Lm.p,
-                        (const float*)lumLin.p, width, height, spec[c], pass,
-                        varMed[c], (float3*)radBuf.p, (float*)varBuf.p);
-                    kWriteBack<<<ceilDiv(n, TPB), TPB>>>(
-                        A[c], A[c], (const RadG*)temp.p,
-                        (const float3*)radBuf.p, (const float*)varBuf.p,
-                        (const float*)mc[c].p, (const float*)lumLin.p, (int)n,
-                        noiseTarget);
-                }
-            }
-
-            // Denormalize back to scene units
-            for (int c = 0; c < 4; ++c)
-                kScaleAov<<<ceilDiv(n, TPB), TPB>>>(A[c], (int)n, lumScale);
-
-            // Post-filter firefly cleanup (quality >= 2)
-            if (denoiseQuality >= 2) {
-                for (int c = 0; c < 4; ++c) {
-                    kLumField<<<ceilDiv(n, TPB), TPB>>>(A[c], (int)n,
-                                                        (float*)lumF.p);
-                    kFireflyClamp<<<ceilDiv(n, TPB), TPB>>>(
-                        A[c], (const float*)lumF.p, width, height, ffGate);
-                }
-            }
-        }
-        denoised = true;   // nlMeans or OIDN — recomposite has a source either way
-
-        // ---- AO (RENDER_AO=1) ----
-        {
-            const bool aoOn = envFlag1("RENDER_AO");
-            if (aoOn) {
-                float aoStrength = 0.6f, aoRadius = 12.0f;
-                int aoTaps = 12;
-                if (const char* e = std::getenv("RENDER_AO_STRENGTH"))
-                    aoStrength = std::strtof(e, nullptr);
-                if (const char* e = std::getenv("RENDER_AO_RADIUS"))
-                    aoRadius = std::strtof(e, nullptr);
-                if (const char* e = std::getenv("RENDER_AO_TAPS"))
-                    aoTaps = std::max(4, std::atoi(e));
-                if (!aoG.alloc(n * 4)) return false;
-                kAO<<<ceilDiv(n, TPB), TPB>>>(G, width, height, aoRadius,
-                                              aoStrength, aoTaps, (float*)aoG.p);
-                kMulAOIndirect<<<ceilDiv(n, TPB), TPB>>>((RadG*)aId.p, (RadG*)aIs.p,
-                                                         (const float*)aoG.p,
-                                                         (int)n);
-                if (oidnG.p)
-                    kMulAOOidn<<<ceilDiv(n, TPB), TPB>>>(
-                        (float*)oidnG.p, (const float*)aoG.p, A[0], A[1], A[2],
-                        A[3], EM, (int)n);
-                fprintf(stderr, "AO: position-based (radius=%.0fpx strength=%.2f taps=%d)\n",
-                        aoRadius, aoStrength, aoTaps);
-                fflush(stderr);
-            }
-        }
-
-        // ---- albedo detail re-injection ----
-        {
-            float detailGain = -1.0f;
-            if (const char* e = std::getenv("RENDER_DENOISE_DETAIL"))
-                detailGain = fmaxf(0.0f, std::strtof(e, nullptr));
-            if (detailGain > 0.0f) {
-                if (!albBlurG.alloc(n * 12)) return false;
-                kAlbBlur<<<ceilDiv(n, TPB), TPB>>>(G, width, height,
-                                                   (float3*)albBlurG.p);
-                kDetailInject<<<ceilDiv(n, TPB), TPB>>>(
-                    (RadG*)aDd.p, (RadG*)aDs.p, (RadG*)aId.p, (RadG*)aIs.p,
-                    G, (const float3*)albBlurG.p, (int)n, detailGain);
-            }
-        }
-
-        // ---- SPP-adaptive energy gain ----
-        {
-            double dnLumSum = 0.0;
-            std::vector<float> dnLum;
-            if (!wbPartial.alloc(ceilDiv(n, TPB) * sizeof(float3))) return false;
-            if (nlMeans) {
-                kLumReduce<<<ceilDiv(n, TPB), TPB>>>(A[0], A[1], A[2], A[3],
-                                                     (int)n,
-                                                     (float3*)wbPartial.p);
-                std::vector<float3> parts(ceilDiv(n, TPB));
-                CUDA_CHECK(cudaMemcpy(parts.data(), wbPartial.p,
-                                      parts.size() * sizeof(float3), cudaMemcpyDeviceToHost));
-                for (const float3& p : parts) dnLumSum += double(p.x);
-                DevBuf samp;
-                if (!samp.alloc(size_t(nS4) * 4)) return false;
-                kCompositeLumSample<<<ceilDiv(nS4, TPB), TPB>>>(
-                    A[0], A[1], A[2], A[3], (int)n, 4, (float*)samp.p);
-                dnLum.resize(nS4);
-                CUDA_CHECK(cudaMemcpy(dnLum.data(), samp.p, size_t(nS4) * 4,
-                                      cudaMemcpyDeviceToHost));
-            } else if (oidnG.p) {
-                kDNLumReduceOidn<<<ceilDiv(n, TPB), TPB>>>(
-                    (const float*)oidnG.p, (int)n, (float3*)wbPartial.p);
-                std::vector<float3> parts(ceilDiv(n, TPB));
-                CUDA_CHECK(cudaMemcpy(parts.data(), wbPartial.p,
-                                      parts.size() * sizeof(float3), cudaMemcpyDeviceToHost));
-                for (const float3& p : parts) dnLumSum += double(p.x);
-                DevBuf samp;
-                if (!samp.alloc(size_t(nS4) * 4)) return false;
-                kDNLumSampleOidn<<<ceilDiv(nS4, TPB), TPB>>>(
-                    (const float*)oidnG.p, (int)n, 4, (float*)samp.p);
-                dnLum.resize(nS4);
-                CUDA_CHECK(cudaMemcpy(dnLum.data(), samp.p, size_t(nS4) * 4,
-                                      cudaMemcpyDeviceToHost));
-            }
-            float energyGain = 1.0f, refGain = 1.0f, r320 = 0.80f, Sdn = 0.0f;
-            if (dnLumSum > 1e-12 && !dnLum.empty()) {
-                std::nth_element(dnLum.begin(), dnLum.begin() + dnLum.size() / 2,
-                                 dnLum.end());
-                const double dnMean = dnLumSum / double(n);
-                const double dnMedian = dnLum[dnLum.size() / 2];
-                Sdn = float(dnMean / fmax(dnMedian, 1e-9));
-                if (const char* e = std::getenv("RENDER_DENOISE_RET320")) {
-                    const double v = std::strtod(e, nullptr);
-                    if (v > 0.0 && v < 1.0) r320 = float(v);
-                }
-                refGain = float((r320 * double(rawLumMean) * double(n)) / dnLumSum);
-                refGain = std::min(3.0f, std::max(0.5f, refGain));
-                if (sppEff < int(SPP_REF)) energyGain = refGain;
-            }
-            if (nlMeans && (energyGain > 1.0001f || energyGain < 0.9999f)) {
-                for (int c = 0; c < 4; ++c)
-                    kGainAov<<<ceilDiv(n, TPB), TPB>>>(A[c], (int)n, energyGain);
-            }
-            if (!nlMeans && oidnG.p &&
-                (energyGain > 1.0001f || energyGain < 0.9999f))
-                kGainOidn<<<ceilDiv(n, TPB), TPB>>>((float*)oidnG.p, (int)n,
-                                                    energyGain);
-            fprintf(stderr, "DENOISE done (lumScale=%.4f spp=%d k=%.3f Sdn=%.2f r320=%.3f refGain=%.3f energyGain=%.3f)\n",
-                    lumScale, sppEff, kSpp, Sdn, r320, refGain, energyGain);
-            fflush(stderr);
-        }
+    // Tier 1: filterVar + pre-firefly clamp
+    if (!ctx.varEst.alloc(n * 4)) return false;
+    fprintf(stderr, "DENOISE start\n"); fflush(stderr);
+    for (int c = 0; c < 4; ++c) {
+        kFilterVar<<<ceilDiv(n, TPB), TPB>>>(A[c], ctx.width, ctx.height,
+                                             (float*)ctx.varEst.p);
+        kAssignVar<<<ceilDiv(n, TPB), TPB>>>(A[c], (const float*)ctx.varEst.p,
+                                             (int)n);
     }
-    CUDA_CHECK(cudaDeviceSynchronize());
-    const double dnMs = msOf(tDn0, std::chrono::steady_clock::now());
-
-    // ======================= emission denoise =======================
-    const auto tDis0 = std::chrono::steady_clock::now();
-    if ((shadeOptions & Photo::DoDenoise) && hasEmission) {
-        if (!scratch4.alloc(n * 16)) return false;
-        CUDA_CHECK(cudaMemcpy(scratch4.p, EM, n * 16, cudaMemcpyDeviceToDevice));
-        kEmissionDenoise<<<ceilDiv(n, TPB), TPB>>>((const float4*)scratch4.p, G,
-                                                   width, height, EM);
+    if (!ctx.lumF.alloc(n * 4)) return false;
+    for (int c = 0; c < 4; ++c) {
+        kLumField<<<ceilDiv(n, TPB), TPB>>>(A[c], (int)n, (float*)ctx.lumF.p);
+        kFireflyClamp<<<ceilDiv(n, TPB), TPB>>>(A[c], (const float*)ctx.lumF.p,
+                                                ctx.width, ctx.height, ffGate);
     }
 
-    // ======================= recomposite =======================
-    if (denoised)
-        kComposite<<<ceilDiv(n, TPB), TPB>>>(
-            A[0], A[1], A[2], A[3], EM,
-            (const float*)(oidnG.p ? oidnG.p : nullptr), (int)n,
-            (float4*)finalG.p);
+    // Normalize to median composite luminance 1.0
+    const float invScale = 1.0f / ctx.lumScale;
+    for (int c = 0; c < 4; ++c)
+        kScaleAov<<<ceilDiv(n, TPB), TPB>>>(A[c], (int)n, invScale);
+    for (int c = 0; c < 4; ++c)
+        kScaleMcVar<<<ceilDiv(n, TPB), TPB>>>((float*)mc[c].p, (int)n,
+                                              invScale * invScale);
 
-    // ======================= tonemap (WB + exposure) =======================
-    {
-        float gR = 1.0f, gG = 1.0f, gB = 1.0f;
-        if (photo.wbStrength > 0.0f) {
-            if (!wbPartial.alloc(ceilDiv(n, TPB) * sizeof(float3))) return false;
-            kWBReduce<<<ceilDiv(n, TPB), TPB>>>((const float4*)finalG.p, (int)n,
-                                                (float3*)wbPartial.p);
-            std::vector<float3> parts(ceilDiv(n, TPB));
-            CUDA_CHECK(cudaMemcpy(parts.data(), wbPartial.p, parts.size() * sizeof(float3),
-                                  cudaMemcpyDeviceToHost));
-            double mr = 0, mg = 0, mb = 0;
-            for (const float3& p : parts) { mr += p.x; mg += p.y; mb += p.z; }
-            mr /= double(n); mg /= double(n); mb /= double(n);
-            const float mLum = float(0.299 * mr + 0.587 * mg + 0.114 * mb);
-            auto wbGain = [&](double m) -> float {
-                if (m < 1e-8) return 1.0f;
-                return 1.0f + photo.wbStrength * (float(mLum / m) - 1.0f);
-            };
-            gR = wbGain(mr); gG = wbGain(mg); gB = wbGain(mb);
-            fprintf(stderr, "WB: mean=(%.2f,%.2f,%.2f) gains=(%.3f,%.3f,%.3f)\n",
-                    mr, mg, mb, gR, gG, gB);
-        }
-        kTonemap<<<ceilDiv(n, TPB), TPB>>>((float4*)finalG.p, (int)n,
-                                           fmaxf(photo.exposure, 1e-6f),
-                                           gR, gG, gB);
+    // Per-AOV median Var (1/7 samples, host median — same stride)
+    float varMed[4] = {1.0f, 1.0f, 1.0f, 1.0f};
+    for (int c = 0; c < 4; ++c) {
+        DevBuf samp;
+        if (!samp.alloc(size_t(nS7) * 4)) return false;
+        kSampleVar<<<ceilDiv(nS7, TPB), TPB>>>(A[c], (int)n, 7,
+                                               (float*)samp.p);
+        std::vector<float> s(nS7);
+        CUDA_CHECK(cudaMemcpy(s.data(), samp.p, size_t(nS7) * 4,
+                              cudaMemcpyDeviceToHost));
+        std::nth_element(s.begin(), s.begin() + s.size() / 2, s.end());
+        varMed[c] = fmaxf(s[s.size() / 2], 1e-12f);
     }
 
-    // ======================= bloom =======================
-    if (shadeOptions & Photo::DoBloom) {
-        if (width >= 4 && height >= 4) {
-            if (!bloomColor.alloc(n * 12) || !bloomTemp.alloc(n * 12))
-                return false;
-            kBloomExtract<<<ceilDiv(n, TPB), TPB>>>(
-                (const float4*)finalG.p, (int)n, (float3*)bloomColor.p);
-            for (int step = 1; step <= 8; step *= 2) {
-                CUDA_CHECK(cudaMemcpy(bloomTemp.p, bloomColor.p, n * 12,
-                                      cudaMemcpyDeviceToDevice));
-                kBloomBlur<<<ceilDiv(n, TPB), TPB>>>(
-                    (const float3*)bloomTemp.p, width, height, step,
-                    (float3*)bloomColor.p);
-                kBloomAdd<<<ceilDiv(n, TPB), TPB>>>(
-                    (float4*)finalG.p, (const float3*)bloomColor.p, (int)n);
-            }
+    // Multi-scale ladder — the same 5x5 log-domain filter as the CPU.
+    if (!ctx.temp.alloc(n * 16) || !ctx.Lm.alloc(n * 12) ||
+        !ctx.lumLin.alloc(n * 4) || !ctx.radBuf.alloc(n * 12) ||
+        !ctx.varBuf.alloc(n * 4))
+        return false;
+    const bool spec[4] = {false, true, false, true};
+    for (int pass = 0; pass < nlPasses; ++pass) {
+        for (int c = 0; c < 4; ++c) {
+            kLogTemp<<<ceilDiv(n, TPB), TPB>>>(A[c], (int)n,
+                                               (RadG*)ctx.temp.p);
+            kLm<<<ceilDiv(n, TPB), TPB>>>((const RadG*)ctx.temp.p, ctx.width,
+                                          ctx.height, (float3*)ctx.Lm.p);
+            kLumLin<<<ceilDiv(n, TPB), TPB>>>(A[c], (int)n,
+                                              (float*)ctx.lumLin.p);
+            kFilterMain<<<ceilDiv(n, TPB), TPB>>>(
+                (const RadG*)ctx.temp.p, ctx.G, (const float3*)ctx.Lm.p,
+                (const float*)ctx.lumLin.p, ctx.width, ctx.height, spec[c],
+                pass, varMed[c], (float3*)ctx.radBuf.p, (float*)ctx.varBuf.p);
+            kWriteBack<<<ceilDiv(n, TPB), TPB>>>(
+                A[c], A[c], (const RadG*)ctx.temp.p,
+                (const float3*)ctx.radBuf.p, (const float*)ctx.varBuf.p,
+                (const float*)mc[c].p, (const float*)ctx.lumLin.p, (int)n,
+                noiseTarget);
         }
     }
 
-    // ======================= gamma =======================
-    {
-        float lutHost[1024]; bool curveOn = false;
-        getContrastCurveLUT(lutHost, curveOn);
-        DevBuf curveG, gradeG;
-        if (curveOn) {
-            if (!curveG.alloc(1024 * 4)) return false;
-            CUDA_CHECK(cudaMemcpy(curveG.p, lutHost, 1024 * 4,
-                                  cudaMemcpyHostToDevice));
-        }
-        const bool gradeOn = photo.gradeBands.size() >= 8;
-        if (gradeOn) {
-            if (!gradeG.alloc(photo.gradeBands.size() * 4)) return false;
-            CUDA_CHECK(cudaMemcpy(gradeG.p, photo.gradeBands.data(),
-                                  photo.gradeBands.size() * 4,
-                                  cudaMemcpyHostToDevice));
-        }
-        GammaParams gp;
-        gp.aces = getUseAcesTonemap();
-        gp.invGamma = 1.0f / 2.2f;
-        gp.sat = photo.saturationBoost;
-        gp.curveOn = curveOn;
-        gp.splitWarm = photo.splitWarm;
-        gp.splitCool = photo.splitCool;
-        gp.splitKeySun = photo.splitKeySun && sunlinessReady;
-        gp.gradeOn = gradeOn;
-        gp.nBands = int(photo.gradeBands.size() / 4);
-        kGamma<<<ceilDiv(n, TPB), TPB>>>(
-            (float4*)finalG.p,
-            (const float*)(sunlinessG.p ? sunlinessG.p : nullptr),
-            (const float*)(curveG.p ? curveG.p : nullptr),
-            (const float*)(gradeG.p ? gradeG.p : nullptr), (int)n, gp);
-    }
+    // Denormalize back to scene units
+    for (int c = 0; c < 4; ++c)
+        kScaleAov<<<ceilDiv(n, TPB), TPB>>>(A[c], (int)n, ctx.lumScale);
 
-    // ======================= despeckle =======================
-    {
-        float dsp = 0.20f;
-        if (const char* e = std::getenv("RENDER_DESPECKLE"))
-            dsp = std::strtof(e, nullptr);
-        if (dsp > 0.0f && width > 0 && height > 0) {
-            if (!scratch4.alloc(n * 16)) return false;   // src copy (reuse)
-            CUDA_CHECK(cudaMemcpy(scratch4.p, finalG.p, n * 16,
-                                  cudaMemcpyDeviceToDevice));
-            kDespeckle<<<ceilDiv(n, TPB), TPB>>>((const float4*)scratch4.p,
-                                                 width, height, dsp,
-                                                 (float4*)finalG.p);
+    // Post-filter firefly cleanup (quality >= 2)
+    if (denoiseQuality >= 2) {
+        for (int c = 0; c < 4; ++c) {
+            kLumField<<<ceilDiv(n, TPB), TPB>>>(A[c], (int)n,
+                                                (float*)ctx.lumF.p);
+            kFireflyClamp<<<ceilDiv(n, TPB), TPB>>>(
+                A[c], (const float*)ctx.lumF.p, ctx.width, ctx.height, ffGate);
         }
     }
+    return true;
+}
 
-    // ======================= FXAA =======================
-    if (shadeOptions & Photo::DoFXAA) {
-        if (width >= 4 && height >= 4) {
-            if (!scratch4.alloc(n * 16)) return false;
-            CUDA_CHECK(cudaMemcpy(scratch4.p, finalG.p, n * 16,
-                                  cudaMemcpyDeviceToDevice));
-            kFXAA<<<ceilDiv(n, TPB), TPB>>>((const float4*)scratch4.p, width,
-                                            height, (float4*)finalG.p);
-        }
+// ---- AO (RENDER_AO=1) ----
+bool gpuAO(GpuPostCtx& ctx) {
+    const size_t n = ctx.n;
+    const bool aoOn = envFlag1("RENDER_AO");
+    if (!aoOn) return true;
+    float aoStrength = 0.6f, aoRadius = 12.0f;
+    int aoTaps = 12;
+    if (const char* e = std::getenv("RENDER_AO_STRENGTH"))
+        aoStrength = std::strtof(e, nullptr);
+    if (const char* e = std::getenv("RENDER_AO_RADIUS"))
+        aoRadius = std::strtof(e, nullptr);
+    if (const char* e = std::getenv("RENDER_AO_TAPS"))
+        aoTaps = std::max(4, std::atoi(e));
+    if (!ctx.aoG.alloc(n * 4)) return false;
+    kAO<<<ceilDiv(n, TPB), TPB>>>(ctx.G, ctx.width, ctx.height, aoRadius,
+                                  aoStrength, aoTaps, (float*)ctx.aoG.p);
+    kMulAOIndirect<<<ceilDiv(n, TPB), TPB>>>((RadG*)ctx.aId.p, (RadG*)ctx.aIs.p,
+                                             (const float*)ctx.aoG.p, (int)n);
+    if (ctx.oidnG.p)
+        kMulAOOidn<<<ceilDiv(n, TPB), TPB>>>(
+            (float*)ctx.oidnG.p, (const float*)ctx.aoG.p, ctx.A[0], ctx.A[1],
+            ctx.A[2], ctx.A[3], ctx.EM, (int)n);
+    fprintf(stderr, "AO: position-based (radius=%.0fpx strength=%.2f taps=%d)\n",
+            aoRadius, aoStrength, aoTaps);
+    fflush(stderr);
+    return true;
+}
+
+// ---- albedo detail re-injection ----
+bool gpuDetailInject(GpuPostCtx& ctx) {
+    const size_t n = ctx.n;
+    float detailGain = -1.0f;
+    if (const char* e = std::getenv("RENDER_DENOISE_DETAIL"))
+        detailGain = fmaxf(0.0f, std::strtof(e, nullptr));
+    if (detailGain > 0.0f) {
+        if (!ctx.albBlurG.alloc(n * 12)) return false;
+        kAlbBlur<<<ceilDiv(n, TPB), TPB>>>(ctx.G, ctx.width, ctx.height,
+                                           (float3*)ctx.albBlurG.p);
+        kDetailInject<<<ceilDiv(n, TPB), TPB>>>(
+            (RadG*)ctx.aDd.p, (RadG*)ctx.aDs.p, (RadG*)ctx.aId.p,
+            (RadG*)ctx.aIs.p, ctx.G, (const float3*)ctx.albBlurG.p, (int)n,
+            detailGain);
     }
-    CUDA_CHECK(cudaDeviceSynchronize());
-    const double disMs = msOf(tDis0, std::chrono::steady_clock::now());
+    return true;
+}
 
-    // ======================= download (D2H write-back) =======================
-    // NOTE: the copies below run in sequence; a failure mid-way (extremely
-    // unlikely — 20+ successful steps precede this) leaves the host Photo in
-    // a mixed state and the CPU fallback would re-denoise it. Accepted: the
-    // fallback path is a last-resort safety net, not a hot path.
-    const auto tDl0 = std::chrono::steady_clock::now();
-    CUDA_CHECK(cudaMemcpy(photo.channels.finalColor, finalG.p, n * 16,
+// ---- SPP-adaptive energy gain ----
+bool gpuEnergyGain(GpuPostCtx& ctx, bool nlMeans, float kSpp) {
+    const size_t n = ctx.n;
+    const unsigned nS4 = ceilDiv(n, 4);
+    RadG** A = ctx.A;
+    static constexpr float SPP_REF = 320.0f;
+
+    double dnLumSum = 0.0;
+    std::vector<float> dnLum;
+    if (!ctx.wbPartial.alloc(ceilDiv(n, TPB) * sizeof(float3))) return false;
+    if (nlMeans) {
+        kLumReduce<<<ceilDiv(n, TPB), TPB>>>(A[0], A[1], A[2], A[3],
+                                             (int)n, (float3*)ctx.wbPartial.p);
+        std::vector<float3> parts(ceilDiv(n, TPB));
+        CUDA_CHECK(cudaMemcpy(parts.data(), ctx.wbPartial.p,
+                              parts.size() * sizeof(float3), cudaMemcpyDeviceToHost));
+        for (const float3& p : parts) dnLumSum += double(p.x);
+        DevBuf samp;
+        if (!samp.alloc(size_t(nS4) * 4)) return false;
+        kCompositeLumSample<<<ceilDiv(nS4, TPB), TPB>>>(
+            A[0], A[1], A[2], A[3], (int)n, 4, (float*)samp.p);
+        dnLum.resize(nS4);
+        CUDA_CHECK(cudaMemcpy(dnLum.data(), samp.p, size_t(nS4) * 4,
+                              cudaMemcpyDeviceToHost));
+    } else if (ctx.oidnG.p) {
+        kDNLumReduceOidn<<<ceilDiv(n, TPB), TPB>>>(
+            (const float*)ctx.oidnG.p, (int)n, (float3*)ctx.wbPartial.p);
+        std::vector<float3> parts(ceilDiv(n, TPB));
+        CUDA_CHECK(cudaMemcpy(parts.data(), ctx.wbPartial.p,
+                              parts.size() * sizeof(float3), cudaMemcpyDeviceToHost));
+        for (const float3& p : parts) dnLumSum += double(p.x);
+        DevBuf samp;
+        if (!samp.alloc(size_t(nS4) * 4)) return false;
+        kDNLumSampleOidn<<<ceilDiv(nS4, TPB), TPB>>>(
+            (const float*)ctx.oidnG.p, (int)n, 4, (float*)samp.p);
+        dnLum.resize(nS4);
+        CUDA_CHECK(cudaMemcpy(dnLum.data(), samp.p, size_t(nS4) * 4,
+                              cudaMemcpyDeviceToHost));
+    }
+    float energyGain = 1.0f, refGain = 1.0f, r320 = 0.80f, Sdn = 0.0f;
+    if (dnLumSum > 1e-12 && !dnLum.empty()) {
+        std::nth_element(dnLum.begin(), dnLum.begin() + dnLum.size() / 2,
+                         dnLum.end());
+        const double dnMean = dnLumSum / double(n);
+        const double dnMedian = dnLum[dnLum.size() / 2];
+        Sdn = float(dnMean / fmax(dnMedian, 1e-9));
+        if (const char* e = std::getenv("RENDER_DENOISE_RET320")) {
+            const double v = std::strtod(e, nullptr);
+            if (v > 0.0 && v < 1.0) r320 = float(v);
+        }
+        refGain = float((r320 * double(ctx.rawLumMean) * double(n)) / dnLumSum);
+        refGain = std::min(3.0f, std::max(0.5f, refGain));
+        if (ctx.sppEff < int(SPP_REF)) energyGain = refGain;
+    }
+    if (nlMeans && (energyGain > 1.0001f || energyGain < 0.9999f)) {
+        for (int c = 0; c < 4; ++c)
+            kGainAov<<<ceilDiv(n, TPB), TPB>>>(A[c], (int)n, energyGain);
+    }
+    if (!nlMeans && ctx.oidnG.p &&
+        (energyGain > 1.0001f || energyGain < 0.9999f))
+        kGainOidn<<<ceilDiv(n, TPB), TPB>>>((float*)ctx.oidnG.p, (int)n,
+                                            energyGain);
+    fprintf(stderr, "DENOISE done (lumScale=%.4f spp=%d k=%.3f Sdn=%.2f r320=%.3f refGain=%.3f energyGain=%.3f)\n",
+            ctx.lumScale, ctx.sppEff, kSpp, Sdn, r320, refGain, energyGain);
+    fflush(stderr);
+    return true;
+}
+
+// ---- denoise block: stats → sun matte → OIDN → NL-means → AO → detail →
+// ---- energy gain (RENDER_SPP-aware; same order as Photo::denoiseRadiance)
+bool gpuPostDenoise(Photo& photo, GpuPostCtx& ctx, int denoiseQuality) {
+    float kSpp = 1.0f, ffGate = 0.0f;
+    if (!gpuDenoiseStats(ctx, kSpp, ffGate)) return false;
+    if (!gpuSunMatte(ctx)) return false;
+
+    bool oidnHostOk = false;
+    if (!gpuOidn(photo, ctx, denoiseQuality, oidnHostOk)) return false;
+    const bool oidnUsed = denoiseQuality >= 3 && oidnHostOk &&
+                          photo.oidnColor.size() == ctx.n * 3;
+    const bool nlMeans = !oidnUsed;
+    const int nlPasses = !nlMeans ? 0
+                       : (denoiseQuality == 1 ? 1 : FILTER_PASSES + 2);
+    const float noiseTarget = getDenoiseNoiseTarget();
+
+    if (nlMeans &&
+        !gpuNlMeans(ctx, nlPasses, noiseTarget, ffGate, denoiseQuality))
+        return false;
+    ctx.denoised = true;   // nlMeans or OIDN — recomposite has a source either way
+
+    if (!gpuAO(ctx)) return false;
+    if (!gpuDetailInject(ctx)) return false;
+    if (!gpuEnergyGain(ctx, nlMeans, kSpp)) return false;
+    return true;
+}
+
+// ---- emission denoise ----
+bool gpuEmissionDenoise(GpuPostCtx& ctx) {
+    const size_t n = ctx.n;
+    if (!ctx.scratch4.alloc(n * 16)) return false;
+    CUDA_CHECK(cudaMemcpy(ctx.scratch4.p, ctx.EM, n * 16,
+                          cudaMemcpyDeviceToDevice));
+    kEmissionDenoise<<<ceilDiv(n, TPB), TPB>>>((const float4*)ctx.scratch4.p,
+                                               ctx.G, ctx.width, ctx.height,
+                                               ctx.EM);
+    return true;
+}
+
+// ---- recomposite ----
+void gpuRecomposite(GpuPostCtx& ctx) {
+    const size_t n = ctx.n;
+    kComposite<<<ceilDiv(n, TPB), TPB>>>(
+        ctx.A[0], ctx.A[1], ctx.A[2], ctx.A[3], ctx.EM,
+        (const float*)(ctx.oidnG.p ? ctx.oidnG.p : nullptr), (int)n,
+        (float4*)ctx.finalG.p);
+}
+
+// ---- tonemap (WB + exposure) ----
+bool gpuTonemap(Photo& photo, GpuPostCtx& ctx) {
+    const size_t n = ctx.n;
+    float gR = 1.0f, gG = 1.0f, gB = 1.0f;
+    if (photo.wbStrength > 0.0f) {
+        if (!ctx.wbPartial.alloc(ceilDiv(n, TPB) * sizeof(float3))) return false;
+        kWBReduce<<<ceilDiv(n, TPB), TPB>>>((const float4*)ctx.finalG.p, (int)n,
+                                            (float3*)ctx.wbPartial.p);
+        std::vector<float3> parts(ceilDiv(n, TPB));
+        CUDA_CHECK(cudaMemcpy(parts.data(), ctx.wbPartial.p,
+                              parts.size() * sizeof(float3),
+                              cudaMemcpyDeviceToHost));
+        double mr = 0, mg = 0, mb = 0;
+        for (const float3& p : parts) { mr += p.x; mg += p.y; mb += p.z; }
+        mr /= double(n); mg /= double(n); mb /= double(n);
+        const float mLum = float(0.299 * mr + 0.587 * mg + 0.114 * mb);
+        auto wbGain = [&](double m) -> float {
+            if (m < 1e-8) return 1.0f;
+            return 1.0f + photo.wbStrength * (float(mLum / m) - 1.0f);
+        };
+        gR = wbGain(mr); gG = wbGain(mg); gB = wbGain(mb);
+        fprintf(stderr, "WB: mean=(%.2f,%.2f,%.2f) gains=(%.3f,%.3f,%.3f)\n",
+                mr, mg, mb, gR, gG, gB);
+    }
+    kTonemap<<<ceilDiv(n, TPB), TPB>>>((float4*)ctx.finalG.p, (int)n,
+                                       fmaxf(photo.exposure, 1e-6f),
+                                       gR, gG, gB);
+    return true;
+}
+
+// ---- bloom ----
+bool gpuBloom(GpuPostCtx& ctx) {
+    const size_t n = ctx.n;
+    if (ctx.width < 4 || ctx.height < 4) return true;
+    if (!ctx.bloomColor.alloc(n * 12) || !ctx.bloomTemp.alloc(n * 12))
+        return false;
+    kBloomExtract<<<ceilDiv(n, TPB), TPB>>>(
+        (const float4*)ctx.finalG.p, (int)n, (float3*)ctx.bloomColor.p);
+    for (int step = 1; step <= 8; step *= 2) {
+        CUDA_CHECK(cudaMemcpy(ctx.bloomTemp.p, ctx.bloomColor.p, n * 12,
+                              cudaMemcpyDeviceToDevice));
+        kBloomBlur<<<ceilDiv(n, TPB), TPB>>>(
+            (const float3*)ctx.bloomTemp.p, ctx.width, ctx.height, step,
+            (float3*)ctx.bloomColor.p);
+        kBloomAdd<<<ceilDiv(n, TPB), TPB>>>(
+            (float4*)ctx.finalG.p, (const float3*)ctx.bloomColor.p, (int)n);
+    }
+    return true;
+}
+
+// ---- gamma (curve LUT + split-tone + grade bands) ----
+bool gpuGamma(Photo& photo, GpuPostCtx& ctx) {
+    const size_t n = ctx.n;
+    float lutHost[1024]; bool curveOn = false;
+    getContrastCurveLUT(lutHost, curveOn);
+    DevBuf curveG, gradeG;
+    if (curveOn) {
+        if (!curveG.alloc(1024 * 4)) return false;
+        CUDA_CHECK(cudaMemcpy(curveG.p, lutHost, 1024 * 4,
+                              cudaMemcpyHostToDevice));
+    }
+    const bool gradeOn = photo.gradeBands.size() >= 8;
+    if (gradeOn) {
+        if (!gradeG.alloc(photo.gradeBands.size() * 4)) return false;
+        CUDA_CHECK(cudaMemcpy(gradeG.p, photo.gradeBands.data(),
+                              photo.gradeBands.size() * 4,
+                              cudaMemcpyHostToDevice));
+    }
+    GammaParams gp;
+    gp.aces = getUseAcesTonemap();
+    gp.invGamma = 1.0f / 2.2f;
+    gp.sat = photo.saturationBoost;
+    gp.curveOn = curveOn;
+    gp.splitWarm = photo.splitWarm;
+    gp.splitCool = photo.splitCool;
+    gp.splitKeySun = photo.splitKeySun && ctx.sunlinessReady;
+    gp.gradeOn = gradeOn;
+    gp.nBands = int(photo.gradeBands.size() / 4);
+    kGamma<<<ceilDiv(n, TPB), TPB>>>(
+        (float4*)ctx.finalG.p,
+        (const float*)(ctx.sunlinessG.p ? ctx.sunlinessG.p : nullptr),
+        (const float*)(curveG.p ? curveG.p : nullptr),
+        (const float*)(gradeG.p ? gradeG.p : nullptr), (int)n, gp);
+    return true;
+}
+
+// ---- despeckle ----
+bool gpuDespeckle(GpuPostCtx& ctx) {
+    const size_t n = ctx.n;
+    float dsp = 0.20f;
+    if (const char* e = std::getenv("RENDER_DESPECKLE"))
+        dsp = std::strtof(e, nullptr);
+    if (dsp > 0.0f && ctx.width > 0 && ctx.height > 0) {
+        if (!ctx.scratch4.alloc(n * 16)) return false;   // src copy (reuse)
+        CUDA_CHECK(cudaMemcpy(ctx.scratch4.p, ctx.finalG.p, n * 16,
+                              cudaMemcpyDeviceToDevice));
+        kDespeckle<<<ceilDiv(n, TPB), TPB>>>((const float4*)ctx.scratch4.p,
+                                             ctx.width, ctx.height, dsp,
+                                             (float4*)ctx.finalG.p);
+    }
+    return true;
+}
+
+// ---- FXAA ----
+bool gpuFxaa(GpuPostCtx& ctx) {
+    const size_t n = ctx.n;
+    if (ctx.width < 4 || ctx.height < 4) return true;
+    if (!ctx.scratch4.alloc(n * 16)) return false;
+    CUDA_CHECK(cudaMemcpy(ctx.scratch4.p, ctx.finalG.p, n * 16,
+                          cudaMemcpyDeviceToDevice));
+    kFXAA<<<ceilDiv(n, TPB), TPB>>>((const float4*)ctx.scratch4.p, ctx.width,
+                                    ctx.height, (float4*)ctx.finalG.p);
+    return true;
+}
+
+// ---- download (D2H write-back) ----
+// NOTE: the copies below run in sequence; a failure mid-way (extremely
+// unlikely — 20+ successful steps precede this) leaves the host Photo in
+// a mixed state and the CPU fallback would re-denoise it. Accepted: the
+// fallback path is a last-resort safety net, not a hot path.
+bool gpuDownload(Photo& photo, GpuPostCtx& ctx) {
+    const size_t n = ctx.n;
+    CUDA_CHECK(cudaMemcpy(photo.channels.finalColor, ctx.finalG.p, n * 16,
                           cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaMemcpy(photo.radiance_Dd, aDd.p, n * 16, cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaMemcpy(photo.radiance_Ds, aDs.p, n * 16, cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaMemcpy(photo.radiance_Id, aId.p, n * 16, cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaMemcpy(photo.radiance_Is, aIs.p, n * 16, cudaMemcpyDeviceToHost));
-    if (hasEmission)
-        CUDA_CHECK(cudaMemcpy(photo.channels.emission, EM, n * 16,
+    CUDA_CHECK(cudaMemcpy(photo.radiance_Dd, ctx.aDd.p, n * 16, cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(photo.radiance_Ds, ctx.aDs.p, n * 16, cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(photo.radiance_Id, ctx.aId.p, n * 16, cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(photo.radiance_Is, ctx.aIs.p, n * 16, cudaMemcpyDeviceToHost));
+    if (ctx.hasEmission)
+        CUDA_CHECK(cudaMemcpy(photo.channels.emission, ctx.EM, n * 16,
                               cudaMemcpyDeviceToHost));
-    if (sunlinessG.p && sunlinessReady) {
+    if (ctx.sunlinessG.p && ctx.sunlinessReady) {
         photo.sunliness.assign(n, 0.0f);
-        CUDA_CHECK(cudaMemcpy(photo.sunliness.data(), sunlinessG.p, n * 4,
+        CUDA_CHECK(cudaMemcpy(photo.sunliness.data(), ctx.sunlinessG.p, n * 4,
                               cudaMemcpyDeviceToHost));
     }
-    if (oidnG.p) {
+    if (ctx.oidnG.p) {
         // Post-AO / post-energy-gain state — matches the CPU path, which
         // mutates photo.oidnColor in place through the same passes.
         photo.oidnColor.assign(n * 3, 0.0f);
-        CUDA_CHECK(cudaMemcpy(photo.oidnColor.data(), oidnG.p, n * 12,
+        CUDA_CHECK(cudaMemcpy(photo.oidnColor.data(), ctx.oidnG.p, n * 12,
                               cudaMemcpyDeviceToHost));
     }
+    return true;
+}
+
+} // namespace
+
+bool postProcessGPU(Photo& photo, int shadeOptions, int spp, int denoiseQuality) {
+    if (!layoutOk()) {
+        fprintf(stderr, "POSTGPU: host/device layout mismatch — CPU fallback\n");
+        return false;
+    }
+    if (!photo.channels.finalColor || photo.width <= 0 || photo.height <= 0 ||
+        !photo.radiance_Dd || !photo.radiance_Ds || !photo.radiance_Id ||
+        !photo.radiance_Is || !photo.Gbuffer)
+        return false;
+
+    GpuPostCtx ctx;
+    ctx.width = photo.width;
+    ctx.height = photo.height;
+    ctx.n = size_t(photo.width) * photo.height;
+    const auto t0 = std::chrono::steady_clock::now();
+    auto msOf = [](const std::chrono::steady_clock::time_point& a,
+                   const std::chrono::steady_clock::time_point& b) {
+        return std::chrono::duration<float, std::milli>(b - a).count();
+    };
+
+    cudaDeviceProp prop{};
+    int devId = 0;
+    cudaGetDevice(&devId);
+    cudaGetDeviceProperties(&prop, devId);
+    fprintf(stderr, "POSTGPU: %dx%d on %s (statistics-equivalent path, NOT byte-identical)\n",
+            ctx.width, ctx.height, prop.name);
+    fflush(stderr);
+
+    // RENDER_SPP backdoor (same as the CPU path).
+    ctx.sppEff = spp;
+    if (const char* e = std::getenv("RENDER_SPP")) {
+        const long v = std::strtol(e, nullptr, 10);
+        if (v > 0) ctx.sppEff = (int)v;
+    }
+
+    const auto tUp0 = std::chrono::steady_clock::now();
+    if (!gpuPostUpload(photo, ctx)) return false;
+    CUDA_CHECK(cudaDeviceSynchronize());
+    const double upMs = msOf(tUp0, std::chrono::steady_clock::now());
+
+    const auto tDn0 = std::chrono::steady_clock::now();
+    if ((shadeOptions & Photo::DoDenoise) &&
+        !gpuPostDenoise(photo, ctx, denoiseQuality))
+        return false;
+    CUDA_CHECK(cudaDeviceSynchronize());
+    const double dnMs = msOf(tDn0, std::chrono::steady_clock::now());
+
+    const auto tDis0 = std::chrono::steady_clock::now();
+    if ((shadeOptions & Photo::DoDenoise) && ctx.hasEmission &&
+        !gpuEmissionDenoise(ctx))
+        return false;
+
+    if (ctx.denoised) gpuRecomposite(ctx);
+
+    if (!gpuTonemap(photo, ctx)) return false;
+
+    if ((shadeOptions & Photo::DoBloom) && !gpuBloom(ctx)) return false;
+
+    if (!gpuGamma(photo, ctx)) return false;
+
+    if (!gpuDespeckle(ctx)) return false;
+
+    if ((shadeOptions & Photo::DoFXAA) && !gpuFxaa(ctx)) return false;
+    CUDA_CHECK(cudaDeviceSynchronize());
+    const double disMs = msOf(tDis0, std::chrono::steady_clock::now());
+
+    const auto tDl0 = std::chrono::steady_clock::now();
+    if (!gpuDownload(photo, ctx)) return false;
     CUDA_CHECK(cudaDeviceSynchronize());
     const double dlMs = msOf(tDl0, std::chrono::steady_clock::now());
 

@@ -355,6 +355,13 @@ void Console::run() {
                 hostMat.texDataHeights   = gpuTexHeights;  // reuse height array
                 hostMat.texFormats       = texFmt.data();
                 hostMat.texByteOffsets   = texByteOff.data();
+                // P0 mipmap chain (device pointers from uploadTextures).
+                hostMat.mipData          = textureUpload.mipRawData;
+                hostMat.mipByteOffsets   = textureUpload.mipByteOffsetsGpu;
+                hostMat.mipLevels        = textureUpload.mipLevelsGpu;
+                hostMat.mipWidths        = textureUpload.mipWidthsGpu;
+                hostMat.mipHeights       = textureUpload.mipHeightsGpu;
+                hostMat.mipLevelStart    = textureUpload.mipStartGpu;
 
                 // Collect emissive faces for GPU NEE, grouped per light object
                 GPUScene::LightData lightData =
@@ -390,6 +397,7 @@ void Console::run() {
                     gpuRawTexData,
                     gpuTexWidths,
                     gpuTexHeights,
+                    textureUpload.mipRawData,
                     gpuSkyTex,
                     skyData.cdf,
                     skyData.cdfSum,

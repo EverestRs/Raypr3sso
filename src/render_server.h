@@ -101,18 +101,14 @@ private:
         std::string modelId;
         uint64_t generation = 0;
         Camera camera;
-        // Display parameters (design 10.4): applied only at preview encode
-        // time, never part of the accumulated radiance — changing them must
-        // not reset accumulation. Defaults come from the session preset.
-        float exposure = 1.0f;
-        float warmTint = 1.0f;
-        float saturationBoost = 1.0f;
-        // -1 = follow the RENDER_BLOOM env default (A1).
-        int bloom = -1;
-        // Directional sun override (A3): sunHas=false means "follow the
-        // RENDER_SUN_* env rig". sunInt=0 with sunHas=true = sun off.
-        bool sunHas = false;
-        float sunAz = 0.0f, sunEl = 45.0f, sunInt = 0.0f;
+        // Display parameters (design 10.4) + directional sun override (A3):
+        // applied at preview encode / task build time, never part of the
+        // accumulated radiance — changing them must not reset accumulation.
+        // Defaults come from the session preset. sunHas=false means "follow
+        // the RENDER_SUN_* env rig"; sunInt=0 with sunHas=true = sun off.
+        // Only the display/sun fields are meaningful here; the physical and
+        // grade knobs are filled per chunk from the rig profile (or env).
+        RenderConfig config;
         // Indoor auto-exposure tier (from the preset, design 10.4): when the
         // camera is inside [indoorMin, indoorMax] the client blends the
         // per-render exposure up to indoorExposure (smoothstep over
@@ -214,31 +210,20 @@ private:
         uint32_t baseSeed = 0;
         // NEE samples per rough hit (设计 17); resolved (1..8) at submit.
         int neeK = 0;
-        // Directional sun (A3): copies of the session's effective sun at
-        // submit time; the worker applies applySunParams when sunHas.
-        bool sunHas = false;
-        float sunAz = 0.0f, sunEl = 0.0f, sunInt = 0.0f;
+        // Physical + display + sun config resolved at submit: the session's
+        // display/sun overrides merged with the position-aware rig profile
+        // (A3). Physical fields feed GPURenderArgs on the GPU worker; display
+        // fields feed the Photo on the encode thread.
+        RenderConfig config;
         // Display-only re-encode (A2): the chain is already at budget and
         // only display params changed — run a 0-sample finalize+encode
         // instead of restarting the chain.
         bool reencode = false;
         // 精修链的预览走 CLI 同源 NL-means 降噪器（拖动档保持原始快速帧）。
         bool denoise = false;
-        // Display-only parameters for the preview encode (10.4).
-        float exposure = 1.0f;
-        float warmTint = 1.0f;
-        float saturationBoost = 1.0f;
-        int bloom = -1;   // -1 = follow the RENDER_BLOOM env default
         // Position-aware rig profile (resolved at submit from the camera
         // position; neutral defaults = "follow the startup env / CLI path").
-        // Physical: applied to GPURenderArgs on the GPU worker.
-        float emissionScale = 1.0f, indirectScale = 1.0f;
-        // Display grade: applied to the Photo on the encode thread.
-        float wbStrength = 0.0f;
-        bool splitKeySun = false;
-        float splitWarm = 0.0f, splitCool = 0.0f;
-        std::string gradeBands;   // raw "l,r,g,b ..." (parsed at encode)
-        bool hasProfile = false;  // true = these fields override the env path
+        bool hasProfile = false;  // true = config overrides the env path
     };
 
     // Self-contained preview-encode work item (encode pipeline): filled by
@@ -257,18 +242,9 @@ private:
         bool emitCompleted = false;  // final chunk: publish render-completed
                                      // after the bytes are stored (so
                                      // GET /image never races the event)
-        // Display-only parameters for the encode (10.4). bloom: -1 = follow
-        // the RENDER_BLOOM env default (the session field drives this).
-        float exposure = 1.0f;
-        float warmTint = 1.0f;
-        float saturationBoost = 1.0f;
-        int bloom = -1;
-        // Position-aware rig profile carried from the ChunkTask
-        // (hasProfile=false = the encode falls back to the env grade path).
-        float wbStrength = 0.0f;
-        bool splitKeySun = false;
-        float splitWarm = 0.0f, splitCool = 0.0f;
-        std::string gradeBands;
+        // Display + grade config carried from the ChunkTask (10.4).
+        // hasProfile=false = the encode falls back to the env grade path.
+        RenderConfig config;
         bool hasProfile = false;
         std::vector<PerPixelData> output;
     };
@@ -304,6 +280,44 @@ private:
                             int& status, std::string& contentType);
     bool handleWebSocket(int clientSocket, const std::string& request);
     void runRenderChunk(const ChunkTask& task, const RenderScheduler::Job& job);
+    // submitRender / runRenderChunk stages (pure extraction: same order,
+    // same semantics; the big functions only orchestrate now).
+    struct RenderParams {
+        int width = 320, height = 180, spp = 4, maxDepth = 4, chunkSpp = 0;
+        bool resetAccumulation = false;
+        uint32_t baseSeed = 0x1234;
+        float exposure = 0.0f;   // 0 = keep the session's display exposure
+        int neeK = 0;            // 0 = process default (设计 17)
+        bool denoise = false;
+        bool progressive = false;
+        int adaptiveMin = 0, adaptiveCheck = 8;
+        float adaptiveThresh = 0.02f;
+        float warmTint = 0.0f, saturationBoost = 0.0f;
+        int bloom = -1;
+        bool sunAzSet = false, sunElSet = false, sunIntSet = false;
+        float sunAz = 0.0f, sunEl = 0.0f, sunInt = 0.0f;
+        bool hasCamera = false;
+        Camera camera;
+    };
+    // Body parse + validation. Non-empty return = 400 error JSON (status set).
+    std::string parseRenderParams(const std::string& body, RenderParams& p, int& status);
+    void mergeSessionOverridesLocked(SessionInfo& session, const RenderParams& p,
+                                     bool& displayChanged, bool& sunChanged);
+    bool armAccumulationResetLocked(SessionInfo& session, const RenderParams& p,
+                                    int effectiveNeeK, bool sunChanged,
+                                    uint64_t generation);
+    ChunkTask buildChunkTaskLocked(const std::string& id, SessionInfo& session,
+                                   SceneEntry& entry, const RenderParams& p,
+                                   int effectiveNeeK, uint64_t generation,
+                                   bool reencode);
+    void consumePendingResetLocked(const std::string& sessionId,
+                                   WavefrontRenderContext* ctx);
+    static GPURenderArgs makeRenderArgs(const ChunkTask& task, int startSample);
+    bool chunkTimedOutLocked(const std::string& renderId);
+    static EncodeJob makeEncodeJob(const ChunkTask& task, int accumulated,
+                                   std::vector<PerPixelData>&& output);
+    void advanceChunkChain(const ChunkTask& task, const RenderScheduler::Job& job,
+                           int accumulated, int startSample);
     // Hand a finished chunk's output to the encode thread (async), or encode
     // synchronously when the queue is full / shutting down.
     void enqueueEncode(EncodeJob&& job);
@@ -326,7 +340,6 @@ private:
     // 设计 13 安全项：Origin 校验（回环/null/白名单）、token 比对辅助、
     // session 过期回收（GPU worker 上释放 CUDA 资源）、任务超时上限。
     bool originAllowed(const std::string& origin) const;
-    static std::string queryParam(const std::string& query, const std::string& key);
     void gcLoop();
     double renderTimeoutSeconds() const;
 

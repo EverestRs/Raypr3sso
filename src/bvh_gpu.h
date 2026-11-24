@@ -51,11 +51,27 @@ int uploadTexturesToGPU(const int* texWidths, const int* texHeights,
                         int numTextures,
                         unsigned long long** outTexObjects,
                         int** outTexWidths, int** outTexHeights,
-                        unsigned char** outRawData); // mixed raw data for manual sampling
+                        unsigned char** outRawData, // mixed raw data for manual sampling
+                        // P0 mipmap chain (optional; null = no mips uploaded).
+                        // Levels are RGBA8, stored level-by-level (separate
+                        // host allocations) into one flat GPU buffer.
+                        const int* mipLevelCounts = nullptr,      // [numTextures]
+                        const int* mipLevelStart = nullptr,       // [numTextures+1]
+                        const long long* mipTexByteOffsets = nullptr, // [numTextures+1]
+                        const unsigned char* const* mipLevelPointers = nullptr, // flat
+                        const int* mipLevelWidths = nullptr,      // flat
+                        const int* mipLevelHeights = nullptr,     // flat
+                        unsigned char** outMipRawData = nullptr,
+                        long long** outMipByteOffsets = nullptr,
+                        int** outMipLevels = nullptr,
+                        int** outMipWidths = nullptr,
+                        int** outMipHeights = nullptr,
+                        int** outMipStart = nullptr);
 void freeGPUTextures(unsigned long long* gpuTexObjs, int numTextures);
 
 // Frees the flat uchar4 texture buffer + width/height arrays (no texObjects).
-void freeGPUTextureBuffers(unsigned char* texData, int* texWidths, int* texHeights);
+void freeGPUTextureBuffers(unsigned char* texData, int* texWidths, int* texHeights,
+                           unsigned char* mipData = nullptr);
 float* uploadSkyCDF(const float* hostCDF, int numEntries);
 void freeGPUCDF(float* gpuCDF);
 #ifdef __cplusplus

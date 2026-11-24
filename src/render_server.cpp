@@ -3,6 +3,7 @@
 #include "render_gpu.h"
 #include "scene_presets.h"
 #include "image.h"
+#include "http_util.h"
 
 #include <algorithm>
 #include <cerrno>
@@ -22,18 +23,17 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
-namespace {
+using http::headerValue;
+using http::httpResponse;
+using http::jsonEscape;
+using http::jsonNumber;
+using http::jsonString;
+using http::jsonVector3;
+using http::queryParam;
+using http::sendAll;
+using http::sendWebSocketText;
 
-std::string jsonEscape(const std::string& value) {
-    std::string result;
-    for (char c : value) {
-        if (c == '"' || c == '\\') result += '\\';
-        if (c == '\n') result += "\\n";
-        else if (c == '\r') result += "\\r";
-        else result += c;
-    }
-    return result;
-}
+namespace {
 
 std::string stateName(RenderJobState state) {
     switch (state) {
@@ -45,43 +45,6 @@ std::string stateName(RenderJobState state) {
     case RenderJobState::failed: return "failed";
     }
     return "unknown";
-}
-
-bool jsonNumber(const std::string& body, const std::string& key, float& value) {
-    const size_t keyPosition = body.find("\"" + key + "\"");
-    if (keyPosition == std::string::npos) return false;
-    const size_t colon = body.find(':', keyPosition);
-    if (colon == std::string::npos) return false;
-    char* end = nullptr;
-    value = std::strtof(body.c_str() + colon + 1, &end);
-    return end != body.c_str() + colon + 1 && std::isfinite(value);
-}
-
-bool jsonVector3(const std::string& body, const std::string& key, float3& value) {
-    const size_t keyPosition = body.find("\"" + key + "\"");
-    if (keyPosition == std::string::npos) return false;
-    const size_t open = body.find('[', keyPosition);
-    const size_t close = body.find(']', open);
-    if (open == std::string::npos || close == std::string::npos) return false;
-    std::string values = body.substr(open + 1, close - open - 1);
-    std::replace(values.begin(), values.end(), ',', ' ');
-    std::istringstream stream(values);
-    return bool(stream >> value.x >> value.y >> value.z) &&
-           std::isfinite(value.x) && std::isfinite(value.y) && std::isfinite(value.z);
-}
-
-// No escape handling: only used for our own short ids/preset names.
-bool jsonString(const std::string& body, const std::string& key, std::string& value) {
-    const size_t keyPosition = body.find("\"" + key + "\"");
-    if (keyPosition == std::string::npos) return false;
-    const size_t colon = body.find(':', keyPosition);
-    if (colon == std::string::npos) return false;
-    const size_t quote1 = body.find('"', colon);
-    if (quote1 == std::string::npos) return false;
-    const size_t quote2 = body.find('"', quote1 + 1);
-    if (quote2 == std::string::npos) return false;
-    value = body.substr(quote1 + 1, quote2 - quote1 - 1);
-    return true;
 }
 
 // ---- Model whitelist (design 13) ----
@@ -116,16 +79,18 @@ std::string eventJson(const std::string& type, const std::string& renderId,
                       int sample, int budget, double avgSpp, uint64_t sequence,
                       int width, int height) {
     std::ostringstream e;
-    e << "{\"type\":\"" << type << "\"";
-    if (!renderId.empty()) e << ",\"renderId\":\"" << renderId << "\"";
-    if (!sessionId.empty()) e << ",\"sessionId\":\"" << sessionId << "\"";
+    e << "{\"type\":\"" << jsonEscape(type) << "\"";
+    if (!renderId.empty()) e << ",\"renderId\":\"" << jsonEscape(renderId) << "\"";
+    if (!sessionId.empty()) e << ",\"sessionId\":\"" << jsonEscape(sessionId) << "\"";
     e << ",\"generation\":" << generation
       << ",\"sample\":" << sample << ",\"sampleBudget\":" << budget
       << ",\"avgSpp\":" << avgSpp;
     if (sequence > 0) e << ",\"sequence\":" << sequence;
     if (width > 0) e << ",\"width\":" << width << ",\"height\":" << height;
     if (!renderId.empty() && sequence > 0)
-        e << ",\"previewUrl\":\"/api/renders/" << renderId << "/preview?seq=" << sequence << "\"";
+        e << ",\"previewUrl\":\"" << jsonEscape("/api/renders/" + renderId +
+                                               "/preview?seq=" + std::to_string(sequence))
+          << "\"";
     e << "}";
     return e.str();
 }
@@ -138,115 +103,6 @@ void cancelIfActive(const RenderScheduler::Job& job) {
     if (s == RenderJobState::queued || s == RenderJobState::running ||
         s == RenderJobState::canceling)
         job->requestCancel();
-}
-
-bool sendAll(int socket, const std::string& data) {
-    size_t sent = 0;
-    while (sent < data.size()) {
-        ssize_t count = send(socket, data.data() + sent, data.size() - sent, MSG_NOSIGNAL);
-        if (count <= 0) return false;
-        sent += size_t(count);
-    }
-    return true;
-}
-
-std::string httpResponse(int status, const std::string& type, const std::string& body) {
-    const char* text = status == 200 ? "OK" : status == 201 ? "Created" :
-                       status == 400 ? "Bad Request" : status == 404 ? "Not Found" :
-                       status == 405 ? "Method Not Allowed" : "Internal Server Error";
-    std::ostringstream response;
-    response << "HTTP/1.1 " << status << ' ' << text << "\r\n"
-             << "Content-Type: " << type << "\r\n"
-             << "Content-Length: " << body.size() << "\r\n"
-             << "Connection: close\r\n"
-             << "Access-Control-Allow-Origin: *\r\n"
-             << "Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n"
-             << "Access-Control-Allow-Headers: Content-Type\r\n\r\n" << body;
-    return response.str();
-}
-
-std::string headerValue(const std::string& request, const std::string& name) {
-    const std::string prefix = name + ": ";
-    size_t begin = request.find(prefix);
-    if (begin == std::string::npos) return {};
-    begin += prefix.size();
-    size_t end = request.find("\r\n", begin);
-    return request.substr(begin, end == std::string::npos ? std::string::npos : end - begin);
-}
-
-uint32_t rotateLeft(uint32_t value, int bits) {
-    return (value << bits) | (value >> (32 - bits));
-}
-
-std::string base64(const unsigned char* data, size_t size) {
-    static const char alphabet[] =
-        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    std::string result;
-    for (size_t i = 0; i < size; i += 3) {
-        const uint32_t value = (uint32_t(data[i]) << 16) |
-                               (i + 1 < size ? uint32_t(data[i + 1]) << 8 : 0) |
-                               (i + 2 < size ? uint32_t(data[i + 2]) : 0);
-        result += alphabet[(value >> 18) & 63];
-        result += alphabet[(value >> 12) & 63];
-        result += i + 1 < size ? alphabet[(value >> 6) & 63] : '=';
-        result += i + 2 < size ? alphabet[value & 63] : '=';
-    }
-    return result;
-}
-
-std::string sha1Base64(const std::string& input) {
-    std::vector<unsigned char> message(input.begin(), input.end());
-    const uint64_t bitLength = uint64_t(message.size()) * 8;
-    message.push_back(0x80);
-    while ((message.size() % 64) != 56) message.push_back(0);
-    for (int shift = 56; shift >= 0; shift -= 8)
-        message.push_back(static_cast<unsigned char>((bitLength >> shift) & 0xff));
-
-    uint32_t h0 = 0x67452301, h1 = 0xefcdab89;
-    uint32_t h2 = 0x98badcfe, h3 = 0x10325476, h4 = 0xc3d2e1f0;
-    for (size_t offset = 0; offset < message.size(); offset += 64) {
-        uint32_t words[80]{};
-        for (int i = 0; i < 16; ++i) {
-            const size_t p = offset + size_t(i) * 4;
-            words[i] = (uint32_t(message[p]) << 24) | (uint32_t(message[p + 1]) << 16) |
-                       (uint32_t(message[p + 2]) << 8) | uint32_t(message[p + 3]);
-        }
-        for (int i = 16; i < 80; ++i)
-            words[i] = rotateLeft(words[i - 3] ^ words[i - 8] ^ words[i - 14] ^ words[i - 16], 1);
-        uint32_t a = h0, b = h1, c = h2, d = h3, e = h4;
-        for (int i = 0; i < 80; ++i) {
-            uint32_t function = 0, constant = 0;
-            if (i < 20) { function = (b & c) | ((~b) & d); constant = 0x5a827999; }
-            else if (i < 40) { function = b ^ c ^ d; constant = 0x6ed9eba1; }
-            else if (i < 60) { function = (b & c) | (b & d) | (c & d); constant = 0x8f1bbcdc; }
-            else { function = b ^ c ^ d; constant = 0xca62c1d6; }
-            const uint32_t next = rotateLeft(a, 5) + function + e + constant + words[i];
-            e = d; d = c; c = rotateLeft(b, 30); b = a; a = next;
-        }
-        h0 += a; h1 += b; h2 += c; h3 += d; h4 += e;
-    }
-    unsigned char digest[20];
-    const uint32_t values[] = {h0, h1, h2, h3, h4};
-    for (int i = 0; i < 5; ++i)
-        for (int j = 0; j < 4; ++j)
-            digest[i * 4 + j] = static_cast<unsigned char>((values[i] >> (24 - j * 8)) & 0xff);
-    return base64(digest, sizeof(digest));
-}
-
-bool sendWebSocketText(int socket, const std::string& text) {
-    std::string frame;
-    frame.push_back(char(0x81));
-    if (text.size() < 126) {
-        frame.push_back(char(text.size()));
-    } else if (text.size() <= 65535) {
-        frame.push_back(126);
-        frame.push_back(char((text.size() >> 8) & 0xff));
-        frame.push_back(char(text.size() & 0xff));
-    } else {
-        return false;
-    }
-    frame += text;
-    return sendAll(socket, frame);
 }
 
 // Temporary progressive-verification aid (design 5.4 A/B): dump the raw
@@ -389,9 +245,9 @@ std::string RenderServer::createSession(const std::string& body, int& status) {
     session.id = id;
     session.modelId = modelId;
     session.camera = camera;
-    session.exposure = exposure;
-    session.warmTint = warmTint;
-    session.saturationBoost = saturationBoost;
+    session.config.exposure = exposure;
+    session.config.warmTint = warmTint;
+    session.config.saturationBoost = saturationBoost;
     session.indoorExposure = indoorExposure;
     session.indoorMargin = indoorMargin;
     for (int a = 0; a < 3; ++a) {
@@ -464,23 +320,6 @@ bool RenderServer::originAllowed(const std::string& origin) const {
         }
     }
     return false;
-}
-
-std::string RenderServer::queryParam(const std::string& query, const std::string& key) {
-    const std::string prefix = key + "=";
-    size_t pos = 0;
-    while (true) {
-        pos = query.find(prefix, pos);
-        if (pos == std::string::npos) return {};
-        if (pos != 0 && query[pos - 1] != '&') {
-            pos += prefix.size();
-            continue;
-        }
-        const size_t end = query.find('&', pos);
-        return query.substr(pos + prefix.size(),
-                            end == std::string::npos ? std::string::npos
-                                                     : end - pos - prefix.size());
-    }
 }
 
 double RenderServer::renderTimeoutSeconds() const {
@@ -669,14 +508,14 @@ std::string RenderServer::sessionStatus(const std::string& id, int& status) {
          << ",\"focus\":" << session.camera.focus
          << ",\"coc\":" << session.camera.coc << "}"
          << ",\"state\":\"" << state << "\""
-         << ",\"exposure\":" << session.exposure
-         << ",\"warmTint\":" << session.warmTint
-         << ",\"saturationBoost\":" << session.saturationBoost
-         << ",\"bloom\":" << session.bloom
-         << ",\"sun\":{\"has\":" << (session.sunHas ? "true" : "false")
-         << ",\"az\":" << session.sunAz
-         << ",\"el\":" << session.sunEl
-         << ",\"int\":" << session.sunInt << "}"
+         << ",\"exposure\":" << session.config.exposure
+         << ",\"warmTint\":" << session.config.warmTint
+         << ",\"saturationBoost\":" << session.config.saturationBoost
+         << ",\"bloom\":" << session.config.bloom
+         << ",\"sun\":{\"has\":" << (session.config.sunHas ? "true" : "false")
+         << ",\"az\":" << session.config.sunAz
+         << ",\"el\":" << session.config.sunEl
+         << ",\"int\":" << session.config.sunInt << "}"
          << ",\"accumSamples\":" << session.wavefront->nextSample()
          << ",\"accumGeneration\":" << session.accumGeneration
          << ",\"previewSequence\":" << session.previewSequence
@@ -737,99 +576,9 @@ std::string RenderServer::updateCamera(const std::string& id, const std::string&
 }
 
 std::string RenderServer::submitRender(const std::string& id, const std::string& body, int& status) {
-    int width = 320, height = 180, spp = 4, maxDepth = 4, chunkSpp = 0;
-    float value = 0.0f;
-    if (jsonNumber(body, "width", value)) width = int(value);
-    if (jsonNumber(body, "height", value)) height = int(value);
-    if (jsonNumber(body, "sppBudget", value)) spp = int(value);
-    if (jsonNumber(body, "maxDepth", value)) maxDepth = int(value);
-    if (jsonNumber(body, "chunkSpp", value)) chunkSpp = int(value);
-    bool resetAccumulation = false;
-    if (jsonNumber(body, "resetAccumulation", value)) resetAccumulation = value != 0.0f;
-    uint32_t baseSeed = 0x1234;
-    if (jsonNumber(body, "seed", value) && value >= 0.0f) baseSeed = uint32_t(value);
-    float exposure = 0.0f;   // 0 = keep the session's display exposure
-    if (jsonNumber(body, "exposure", value) && value > 0.0f && std::isfinite(value))
-        exposure = value;
-    // NEE K（设计 17）：未指定=进程默认；有效范围 1..8（kernel 端同样钳制）。
-    int neeK = 0;
-    if (jsonNumber(body, "neeK", value) && std::isfinite(value))
-        neeK = std::min(8, std::max(1, int(value)));
-    // 降噪（设计 9"必要时开启降噪"）：精修链开，拖动档保持原始快速帧。
-    bool denoise = false;
-    if (jsonNumber(body, "denoise", value)) denoise = value != 0.0f;
-    // 渐进链（批1）：几何 chunk 计划（2,4,8,16,...），首帧快、编码次数减半；
-    // final chunk 用 OIDN-only 降噪 + 无损 PNG。显式 chunkSpp 优先生效。
-    bool progressive = false;
-    if (jsonNumber(body, "progressive", value)) progressive = value != 0.0f;
-    // 自适应逐像素采样（批2）：budget 花在需要的像素上。sanitize 要求
-    // adaptiveMin < 每 chunk spp——几何计划下只有大 chunk 实际启用。
-    int adaptiveMin = 0, adaptiveCheck = 8;
-    float adaptiveThresh = 0.02f;
-    if (jsonNumber(body, "adaptiveMin", value))
-        adaptiveMin = std::min(4096, std::max(2, int(value)));
-    if (jsonNumber(body, "adaptiveCheck", value))
-        adaptiveCheck = std::min(1024, std::max(2, int(value)));
-    if (jsonNumber(body, "adaptiveThresh", value))
-        adaptiveThresh = std::min(1.0f, std::max(1e-4f, value));
-    // Display-only params (A1, 10.4): absent/0 = keep the session's value.
-    // Changing any of these NEVER resets the accumulation — they are applied
-    // at preview-encode time only.
-    float warmTint = 0.0f;
-    if (jsonNumber(body, "warmTint", value) && value > 0.0f && std::isfinite(value))
-        warmTint = std::min(4.0f, std::max(0.25f, value));
-    float saturationBoost = 0.0f;
-    if (jsonNumber(body, "saturationBoost", value) && value >= 0.0f && std::isfinite(value))
-        saturationBoost = std::min(4.0f, value);
-    int bloom = -1;
-    if (jsonNumber(body, "bloom", value)) bloom = value != 0.0f ? 1 : 0;
-    // Directional sun override (A3): any of the three keys arms the session
-    // override (each key merges over the previous values). sunInt=0 = sun
-    // off. Radiance-affecting: a change resets the accumulation (4.2).
-    bool sunAzSet = false, sunElSet = false, sunIntSet = false;
-    float sunAz = 0.0f, sunEl = 0.0f, sunInt = 0.0f;
-    if (jsonNumber(body, "sunAz", value) && std::isfinite(value)) {
-        sunAz = value; sunAzSet = true;
-    }
-    if (jsonNumber(body, "sunEl", value) && std::isfinite(value)) {
-        sunEl = value; sunElSet = true;
-    }
-    if (jsonNumber(body, "sunInt", value) && std::isfinite(value)) {
-        sunInt = value; sunIntSet = true;
-    }
-    // Merged camera (批1): an optional "camera" object in the render body
-    // replaces the separate POST /camera round trip — one RTT per submit.
-    // The JSON helpers are substring-based, so the nested camera fields
-    // (position/direction/up/fov — no name collisions with render fields)
-    // parse straight out of the body.
-    const bool hasCamera = body.find("\"camera\"") != std::string::npos;
-    Camera cam;
-    if (hasCamera) {
-        if (!jsonVector3(body, "position", cam.position) ||
-            !jsonVector3(body, "direction", cam.direction) ||
-            !jsonVector3(body, "up", cam.up) ||
-            !jsonNumber(body, "fov", cam.fov)) {
-            status = 400;
-            return R"({"error":"invalid_camera","message":"position, direction, up and fov are required"})";
-        }
-        jsonNumber(body, "focus", cam.focus);
-        jsonNumber(body, "coc", cam.coc);
-        const float dirLen = glm::length(cam.direction);
-        const float upLen = glm::length(cam.up);
-        const float alignment = dirLen > 0.0f && upLen > 0.0f
-            ? std::abs(glm::dot(glm::normalize(cam.direction), glm::normalize(cam.up))) : 1.0f;
-        if (dirLen < 1e-5f || upLen < 1e-5f || alignment >= 0.999f ||
-            cam.fov <= 1.0f || cam.fov >= 150.0f) {
-            status = 400;
-            return R"({"error":"invalid_camera","message":"camera basis or fov is out of range"})";
-        }
-    }
-    if (width < 16 || width > 1920 || height < 16 || height > 1080 ||
-        spp < 1 || spp > 4096 || maxDepth < 1 || maxDepth > 32 ||
-        (chunkSpp != 0 && (chunkSpp < 1 || chunkSpp > spp))) {
-        status = 400;
-        return R"({"error":"render_limits"})";
-    }
+    RenderParams p;
+    const std::string error = parseRenderParams(body, p, status);
+    if (!error.empty()) return error;
 
     std::lock_guard<std::mutex> lock(mutex_);
     auto it = sessions_.find(id);
@@ -852,13 +601,151 @@ std::string RenderServer::submitRender(const std::string& id, const std::string&
     if (session.activeJob && (session.activeJob->state() == RenderJobState::running ||
                               session.activeJob->state() == RenderJobState::queued))
         cancelIfActive(session.activeJob);
+    // Camera / display / sun merge into the session (10.4, A1/A3).
+    bool displayChanged = false, sunChanged = false;
+    mergeSessionOverridesLocked(session, p, displayChanged, sunChanged);
+    const uint64_t generation = session.generation;
+    // renders_ 记录上限：超出时先淘汰终态记录（释放最终图内存）。
+    while (renders_.size() > 64) {
+        bool evicted = false;
+        for (auto it = renders_.begin(); it != renders_.end(); ++it) {
+            const RenderJobState s = it->second.job->state();
+            if (s == RenderJobState::completed || s == RenderJobState::canceled ||
+                s == RenderJobState::failed) {
+                renders_.erase(it);
+                evicted = true;
+                break;
+            }
+        }
+        if (!evicted) break;
+    }
+    // NEE K 属于"每 sample 积分器质量参数"（设计 4.2）：变化即重置累积。
+    // 太阳同理（A3，radiance-affecting）。
+    const int effectiveNeeK = p.neeK > 0 ? p.neeK : defaultNeeK();
+    const bool resetArmed = armAccumulationResetLocked(session, p, effectiveNeeK,
+                                                      sunChanged, generation);
+    // A2: display-only change with the accumulation intact — if the chain
+    // already reached its budget, the worker runs one 0-sample re-encode
+    // instead of restarting (a still-running chain just encodes the next
+    // chunk with the new display params).
+    const bool reencode = displayChanged && !resetArmed;
+    // Progressive chain: each job renders one chunk of samples; the worker
+    // re-submits the next chunk until sppBudget is reached (design 4.3).
+    ChunkTask task = buildChunkTaskLocked(id, session, entry->second, p,
+                                          effectiveNeeK, generation, reencode);
+    auto job = scheduler_.submit(generation, [this, task](const RenderScheduler::Job& job) {
+        runRenderChunk(task, job);
+    });
+    session.activeJob = job;
+    RenderRecord record;
+    record.sessionId = id;
+    record.generation = generation;
+    record.width = p.width;
+    record.height = p.height;
+    record.job = job;
+    renders_[task.renderId] = std::move(record);
+    return "{\"accepted\":true,\"renderId\":\"" + task.renderId +
+           "\",\"generation\":" + std::to_string(generation) + "}";
+}
+
+// ---- submitRender / runRenderChunk stages. Pure extraction: same order,
+// ---- same semantics; the orchestrators only sequence the steps now.
+
+std::string RenderServer::parseRenderParams(const std::string& body, RenderParams& p,
+                                            int& status) {
+    float value = 0.0f;
+    if (jsonNumber(body, "width", value)) p.width = int(value);
+    if (jsonNumber(body, "height", value)) p.height = int(value);
+    if (jsonNumber(body, "sppBudget", value)) p.spp = int(value);
+    if (jsonNumber(body, "maxDepth", value)) p.maxDepth = int(value);
+    if (jsonNumber(body, "chunkSpp", value)) p.chunkSpp = int(value);
+    if (jsonNumber(body, "resetAccumulation", value)) p.resetAccumulation = value != 0.0f;
+    if (jsonNumber(body, "seed", value) && value >= 0.0f) p.baseSeed = uint32_t(value);
+    // 0 = keep the session's display exposure
+    if (jsonNumber(body, "exposure", value) && value > 0.0f && std::isfinite(value))
+        p.exposure = value;
+    // NEE K（设计 17）：未指定=进程默认；有效范围 1..8（kernel 端同样钳制）。
+    if (jsonNumber(body, "neeK", value) && std::isfinite(value))
+        p.neeK = std::min(8, std::max(1, int(value)));
+    // 降噪（设计 9"必要时开启降噪"）：精修链开，拖动档保持原始快速帧。
+    if (jsonNumber(body, "denoise", value)) p.denoise = value != 0.0f;
+    // 渐进链（批1）：几何 chunk 计划（2,4,8,16,...），首帧快、编码次数减半；
+    // final chunk 用 OIDN-only 降噪 + 无损 PNG。显式 chunkSpp 优先生效。
+    if (jsonNumber(body, "progressive", value)) p.progressive = value != 0.0f;
+    // 自适应逐像素采样（批2）：budget 花在需要的像素上。sanitize 要求
+    // adaptiveMin < 每 chunk spp——几何计划下只有大 chunk 实际启用。
+    if (jsonNumber(body, "adaptiveMin", value))
+        p.adaptiveMin = std::min(4096, std::max(2, int(value)));
+    if (jsonNumber(body, "adaptiveCheck", value))
+        p.adaptiveCheck = std::min(1024, std::max(2, int(value)));
+    if (jsonNumber(body, "adaptiveThresh", value))
+        p.adaptiveThresh = std::min(1.0f, std::max(1e-4f, value));
+    // Display-only params (A1, 10.4): absent/0 = keep the session's value.
+    // Changing any of these NEVER resets the accumulation — they are applied
+    // at preview-encode time only.
+    if (jsonNumber(body, "warmTint", value) && value > 0.0f && std::isfinite(value))
+        p.warmTint = std::min(4.0f, std::max(0.25f, value));
+    if (jsonNumber(body, "saturationBoost", value) && value >= 0.0f && std::isfinite(value))
+        p.saturationBoost = std::min(4.0f, value);
+    if (jsonNumber(body, "bloom", value)) p.bloom = value != 0.0f ? 1 : 0;
+    // Directional sun override (A3): any of the three keys arms the session
+    // override (each key merges over the previous values). sunInt=0 = sun
+    // off. Radiance-affecting: a change resets the accumulation (4.2).
+    if (jsonNumber(body, "sunAz", value) && std::isfinite(value)) {
+        p.sunAz = value; p.sunAzSet = true;
+    }
+    if (jsonNumber(body, "sunEl", value) && std::isfinite(value)) {
+        p.sunEl = value; p.sunElSet = true;
+    }
+    if (jsonNumber(body, "sunInt", value) && std::isfinite(value)) {
+        p.sunInt = value; p.sunIntSet = true;
+    }
+    // Merged camera (批1): an optional "camera" object in the render body
+    // replaces the separate POST /camera round trip — one RTT per submit.
+    // The JSON helpers are substring-based, so the nested camera fields
+    // (position/direction/up/fov — no name collisions with render fields)
+    // parse straight out of the body.
+    p.hasCamera = body.find("\"camera\"") != std::string::npos;
+    Camera& cam = p.camera;
+    if (p.hasCamera) {
+        if (!jsonVector3(body, "position", cam.position) ||
+            !jsonVector3(body, "direction", cam.direction) ||
+            !jsonVector3(body, "up", cam.up) ||
+            !jsonNumber(body, "fov", cam.fov)) {
+            status = 400;
+            return R"({"error":"invalid_camera","message":"position, direction, up and fov are required"})";
+        }
+        jsonNumber(body, "focus", cam.focus);
+        jsonNumber(body, "coc", cam.coc);
+        const float dirLen = glm::length(cam.direction);
+        const float upLen = glm::length(cam.up);
+        const float alignment = dirLen > 0.0f && upLen > 0.0f
+            ? std::abs(glm::dot(glm::normalize(cam.direction), glm::normalize(cam.up))) : 1.0f;
+        if (dirLen < 1e-5f || upLen < 1e-5f || alignment >= 0.999f ||
+            cam.fov <= 1.0f || cam.fov >= 150.0f) {
+            status = 400;
+            return R"({"error":"invalid_camera","message":"camera basis or fov is out of range"})";
+        }
+    }
+    if (p.width < 16 || p.width > 1920 || p.height < 16 || p.height > 1080 ||
+        p.spp < 1 || p.spp > 4096 || p.maxDepth < 1 || p.maxDepth > 32 ||
+        (p.chunkSpp != 0 && (p.chunkSpp < 1 || p.chunkSpp > p.spp))) {
+        status = 400;
+        return R"({"error":"render_limits"})";
+    }
+    return "";
+}
+
+void RenderServer::mergeSessionOverridesLocked(SessionInfo& session, const RenderParams& p,
+                                               bool& displayChanged, bool& sunChanged) {
     // Merged camera (批1): apply before the generation read, exactly like
     // POST /camera does — one RTT per submit instead of two. An IDENTICAL
     // camera (position/basis/fov/focus/coc within epsilon) does NOT bump
     // the generation: display-only re-submits (exposure/bloom/… tweaks)
     // must keep the accumulation (10.4) — previously any /render carrying a
     // camera restarted from sample 0 and threw away the refinement.
-    if (hasCamera) {
+    if (p.hasCamera) {
+        const Camera& cam = p.camera;
         const glm::vec3 nd = glm::normalize(cam.direction);
         const glm::vec3 nu = glm::normalize(cam.up);
         const Camera& cur = session.camera;
@@ -877,103 +764,87 @@ std::string RenderServer::submitRender(const std::string& id, const std::string&
         }
     }
     // Display-only params (10.4/A1): applied at encode time, never reset.
-    const bool displayChanged =
-        (exposure > 0.0f && std::abs(exposure - session.exposure) > 1e-4f) ||
-        (warmTint > 0.0f && std::abs(warmTint - session.warmTint) > 1e-4f) ||
-        (saturationBoost > 0.0f &&
-         std::abs(saturationBoost - session.saturationBoost) > 1e-4f) ||
-        (bloom >= 0 && bloom != session.bloom);
-    if (exposure > 0.0f) session.exposure = exposure;
-    if (warmTint > 0.0f) session.warmTint = warmTint;
-    if (saturationBoost > 0.0f) session.saturationBoost = saturationBoost;
-    if (bloom >= 0) session.bloom = bloom;
+    displayChanged =
+        (p.exposure > 0.0f && std::abs(p.exposure - session.config.exposure) > 1e-4f) ||
+        (p.warmTint > 0.0f && std::abs(p.warmTint - session.config.warmTint) > 1e-4f) ||
+        (p.saturationBoost > 0.0f &&
+         std::abs(p.saturationBoost - session.config.saturationBoost) > 1e-4f) ||
+        (p.bloom >= 0 && p.bloom != session.config.bloom);
+    if (p.exposure > 0.0f) session.config.exposure = p.exposure;
+    if (p.warmTint > 0.0f) session.config.warmTint = p.warmTint;
+    if (p.saturationBoost > 0.0f) session.config.saturationBoost = p.saturationBoost;
+    if (p.bloom >= 0) session.config.bloom = p.bloom;
     // Sun override merge (A3): compare before storing to detect changes.
-    bool sunChanged = false;
-    if (sunAzSet || sunElSet || sunIntSet) {
-        const bool hadSun = session.sunHas;
-        const float oAz = session.sunAz, oEl = session.sunEl, oInt = session.sunInt;
-        if (sunAzSet)
-            session.sunAz = std::fmod(std::fmod(sunAz, 360.0f) + 360.0f, 360.0f);
-        if (sunElSet)
-            session.sunEl = std::min(90.0f, std::max(-90.0f, sunEl));
-        if (sunIntSet)
-            session.sunInt = std::min(200.0f, std::max(0.0f, sunInt));
+    sunChanged = false;
+    if (p.sunAzSet || p.sunElSet || p.sunIntSet) {
+        const bool hadSun = session.config.sunHas;
+        const float oAz = session.config.sunAz, oEl = session.config.sunEl,
+                    oInt = session.config.sunInt;
+        if (p.sunAzSet)
+            session.config.sunAz = std::fmod(std::fmod(p.sunAz, 360.0f) + 360.0f, 360.0f);
+        if (p.sunElSet)
+            session.config.sunEl = std::min(90.0f, std::max(-90.0f, p.sunEl));
+        if (p.sunIntSet)
+            session.config.sunInt = std::min(200.0f, std::max(0.0f, p.sunInt));
         sunChanged = !hadSun ||
-                     std::abs(session.sunAz - oAz) > 1e-3f ||
-                     std::abs(session.sunEl - oEl) > 1e-3f ||
-                     std::abs(session.sunInt - oInt) > 1e-3f;
-        session.sunHas = true;
+                     std::abs(session.config.sunAz - oAz) > 1e-3f ||
+                     std::abs(session.config.sunEl - oEl) > 1e-3f ||
+                     std::abs(session.config.sunInt - oInt) > 1e-3f;
+        session.config.sunHas = true;
     }
+}
 
-    // Reset accumulation when anything radiance-affecting changed
-    // (generation, resolution) or the caller asked for it (design 4.2/5.2).
-    // The actual reset runs on the GPU worker (runRenderChunk consumes
-    // pendingReset): resetAccumulation issues cudaMemset on the context's
-    // buffers AND its nextSample.store(0) would race the in-flight chunk's
-    // final store (the stale value would win and the new chain would resume
-    // at a shifted sample index).
-    WavefrontRenderContext* ctx = session.wavefront.get();
-    const uint64_t generation = session.generation;
-    // renders_ 记录上限：超出时先淘汰终态记录（释放最终图内存）。
-    while (renders_.size() > 64) {
-        bool evicted = false;
-        for (auto it = renders_.begin(); it != renders_.end(); ++it) {
-            const RenderJobState s = it->second.job->state();
-            if (s == RenderJobState::completed || s == RenderJobState::canceled ||
-                s == RenderJobState::failed) {
-                renders_.erase(it);
-                evicted = true;
-                break;
-            }
-        }
-        if (!evicted) break;
-    }
+// Reset accumulation when anything radiance-affecting changed
+// (generation, resolution) or the caller asked for it (design 4.2/5.2).
+// The actual reset runs on the GPU worker (runRenderChunk consumes
+// pendingReset): resetAccumulation issues cudaMemset on the context's
+// buffers AND its nextSample.store(0) would race the in-flight chunk's
+// final store (the stale value would win and the new chain would resume
+// at a shifted sample index).
+bool RenderServer::armAccumulationResetLocked(SessionInfo& session, const RenderParams& p,
+                                              int effectiveNeeK, bool sunChanged,
+                                              uint64_t generation) {
     // NEE K 属于"每 sample 积分器质量参数"（设计 4.2）：变化即重置累积。
     // 太阳同理（A3，radiance-affecting）。
-    const int effectiveNeeK = neeK > 0 ? neeK : defaultNeeK();
-    const bool sunDiffers = session.sunHas != session.accumSunHas ||
-        (session.sunHas &&
-         (std::abs(session.sunAz - session.accumSunAz) > 1e-3f ||
-          std::abs(session.sunEl - session.accumSunEl) > 1e-3f ||
-          std::abs(session.sunInt - session.accumSunInt) > 1e-3f));
+    const bool sunDiffers = session.config.sunHas != session.accumSunHas ||
+        (session.config.sunHas &&
+         (std::abs(session.config.sunAz - session.accumSunAz) > 1e-3f ||
+          std::abs(session.config.sunEl - session.accumSunEl) > 1e-3f ||
+          std::abs(session.config.sunInt - session.accumSunInt) > 1e-3f));
     bool resetArmed = false;
-    if (resetAccumulation || generation != session.accumGeneration ||
-        width != session.accumWidth || height != session.accumHeight ||
+    if (p.resetAccumulation || generation != session.accumGeneration ||
+        p.width != session.accumWidth || p.height != session.accumHeight ||
         effectiveNeeK != session.accumNeeK || sunChanged || sunDiffers) {
         session.pendingReset = true;
         session.accumGeneration = generation;
-        session.accumWidth = width;
-        session.accumHeight = height;
+        session.accumWidth = p.width;
+        session.accumHeight = p.height;
         session.accumNeeK = effectiveNeeK;
-        session.accumSunHas = session.sunHas;
-        session.accumSunAz = session.sunAz;
-        session.accumSunEl = session.sunEl;
-        session.accumSunInt = session.sunInt;
+        session.accumSunHas = session.config.sunHas;
+        session.accumSunAz = session.config.sunAz;
+        session.accumSunEl = session.config.sunEl;
+        session.accumSunInt = session.config.sunInt;
         resetArmed = true;
     }
-    // A2: display-only change with the accumulation intact — if the chain
-    // already reached its budget, the worker runs one 0-sample re-encode
-    // instead of restarting (a still-running chain just encodes the next
-    // chunk with the new display params).
-    const bool reencode = displayChanged && !resetArmed;
+    return resetArmed;
+}
 
-    // Progressive chain: each job renders one chunk of samples; the worker
-    // re-submits the next chunk until sppBudget is reached (design 4.3).
-    // progressive (批1): explicit chunkSpp wins; otherwise the chain uses the
-    // geometric plan (2,4,8,16,...) computed per continuation.
-    //
+RenderServer::ChunkTask RenderServer::buildChunkTaskLocked(const std::string& id, SessionInfo& session,
+                                             SceneEntry& entry, const RenderParams& p,
+                                             int effectiveNeeK, uint64_t generation,
+                                             bool reencode) {
     // Position-aware rig profile: pick by the EFFECTIVE camera position.
     // indoor = inside the interior box grown by indoorMargin — the same box
     // the client's exposure tier blends on. Pure data on the task channel;
     // no setenv anywhere near this (HTTP thread).
     const RigProfile* prof = nullptr;
     if (session.outdoorProf.valid) {
-        const float3& p = session.camera.position;
+        const float3& pos = session.camera.position;
         const float m = session.indoorMargin;
         const bool indoor =
-            p.x >= session.indoorMin[0] - m && p.x <= session.indoorMax[0] + m &&
-            p.y >= session.indoorMin[1] - m && p.y <= session.indoorMax[1] + m &&
-            p.z >= session.indoorMin[2] - m && p.z <= session.indoorMax[2] + m;
+            pos.x >= session.indoorMin[0] - m && pos.x <= session.indoorMax[0] + m &&
+            pos.y >= session.indoorMin[1] - m && pos.y <= session.indoorMax[1] + m &&
+            pos.z >= session.indoorMin[2] - m && pos.z <= session.indoorMax[2] + m;
         prof = indoor ? &session.indoorProf : &session.outdoorProf;
         session.activeOutdoor = !indoor;  // observability; crossing the
         // boundary is a camera change, which already resets the accumulation
@@ -982,100 +853,72 @@ std::string RenderServer::submitRender(const std::string& id, const std::string&
     task.sessionId = id;
     task.renderId = "r-" + std::to_string(nextRenderId_++);
     task.generation = generation;
-    task.scene = entry->second.scene.get();
-    task.ctx = ctx;
+    task.scene = entry.scene.get();
+    task.ctx = session.wavefront.get();
     task.camera = session.camera;
-    task.width = width;
-    task.height = height;
-    task.spp = spp;
-    task.progressive = progressive && chunkSpp == 0;
-    task.chunkSpp = chunkSpp > 0 ? chunkSpp
+    task.width = p.width;
+    task.height = p.height;
+    task.spp = p.spp;
+    task.progressive = p.progressive && p.chunkSpp == 0;
+    task.chunkSpp = p.chunkSpp > 0 ? p.chunkSpp
                   : task.progressive ? 2
-                  : spp;
-    task.maxDepth = maxDepth;
-    task.baseSeed = baseSeed;
+                  : p.spp;
+    task.maxDepth = p.maxDepth;
+    task.baseSeed = p.baseSeed;
     task.neeK = effectiveNeeK;
-    task.denoise = denoise;
-    task.adaptiveMin = adaptiveMin;
-    task.adaptiveCheck = adaptiveCheck;
-    task.adaptiveThresh = adaptiveThresh;
-    task.exposure = session.exposure;
-    task.warmTint = session.warmTint;
-    task.saturationBoost = session.saturationBoost;
-    task.bloom = session.bloom;
-    task.sunHas = session.sunHas;
-    task.sunAz = session.sunAz;
-    task.sunEl = session.sunEl;
-    task.sunInt = session.sunInt;
+    task.denoise = p.denoise;
+    task.adaptiveMin = p.adaptiveMin;
+    task.adaptiveCheck = p.adaptiveCheck;
+    task.adaptiveThresh = p.adaptiveThresh;
+    task.config = session.config;
     task.reencode = reencode;
     if (prof) {
         task.hasProfile = true;
-        task.emissionScale = prof->emissionScale;
-        task.indirectScale = prof->indirectScale;
-        task.wbStrength = prof->wbStrength;
-        task.splitKeySun = prof->splitKeySun;
-        task.splitWarm = prof->splitWarm;
-        task.splitCool = prof->splitCool;
-        task.gradeBands = prof->gradeBands;
+        const RenderConfig& pc = prof->config;
+        task.config.emissionScale = pc.emissionScale;
+        task.config.indirectScale = pc.indirectScale;
+        task.config.wbStrength = pc.wbStrength;
+        task.config.splitKeySun = pc.splitKeySun;
+        task.config.splitWarm = pc.splitWarm;
+        task.config.splitCool = pc.splitCool;
+        task.config.gradeBands = pc.gradeBands;
+        task.config.useMipmaps = pc.useMipmaps;
+        task.config.anisoMax = pc.anisoMax;
+        task.config.lodScale = pc.lodScale;
         // Client-pinned saturation (slider) wins over the profile default.
-        if (session.saturationBoost != 1.0f)
-            task.saturationBoost = session.saturationBoost;
+        if (session.config.saturationBoost != 1.0f)
+            task.config.saturationBoost = session.config.saturationBoost;
         else
-            task.saturationBoost = prof->saturationBoost;
-        // Sun: the client's explicit override (session.sunHas, A3) wins;
-        // otherwise the profile arms it.
-        if (!session.sunHas && prof->hasSun) {
-            task.sunHas = true;
-            task.sunAz = prof->sunAz;
-            task.sunEl = prof->sunEl;
-            task.sunInt = prof->sunInt;
+            task.config.saturationBoost = pc.saturationBoost;
+        // Sun: the client's explicit override (A3) wins; otherwise the
+        // profile arms it.
+        if (!session.config.sunHas && pc.sunHas) {
+            task.config.sunHas = true;
+            task.config.sunAz = pc.sunAz;
+            task.config.sunEl = pc.sunEl;
+            task.config.sunInt = pc.sunInt;
         }
         // Exposure default when the body sent none: the indoor tier value
         // for the indoor profile, the outdoor base otherwise. (The browser
         // client always sends its blended tier exposure, which wins here.)
-        if (exposure <= 0.0f)
-            task.exposure = (prof == &session.indoorProf && session.indoorExposure > 0.0f)
-                          ? session.indoorExposure : session.exposure;
+        if (p.exposure <= 0.0f)
+            task.config.exposure = (prof == &session.indoorProf && session.indoorExposure > 0.0f)
+                          ? session.indoorExposure : session.config.exposure;
     }
-    auto job = scheduler_.submit(generation, [this, task](const RenderScheduler::Job& job) {
-        runRenderChunk(task, job);
-    });
-    session.activeJob = job;
-    RenderRecord record;
-    record.sessionId = id;
-    record.generation = generation;
-    record.width = width;
-    record.height = height;
-    record.job = job;
-    renders_[task.renderId] = std::move(record);
-    return "{\"accepted\":true,\"renderId\":\"" + task.renderId +
-           "\",\"generation\":" + std::to_string(generation) + "}";
+    return task;
 }
+
 
 void RenderServer::runRenderChunk(const ChunkTask& task, const RenderScheduler::Job& job) {
     WavefrontRenderContext* ctx = task.ctx;
-    // Consume a pending accumulation reset HERE, on the GPU worker: the
-    // reset's cudaMemset must not run on an HTTP thread (submitRender only
-    // arms the flag), and doing it before reading nextSample guarantees the
-    // new chain starts at sample 0 even when it cancelled an in-flight
-    // chunk whose final store would otherwise overwrite the counter
-    // (measured: a mid-loop cancel left nextSample=6, and the next chain
-    // resumed at start=6 with zeroed accumulators -> wrong radiance).
-    {
-        std::lock_guard<std::mutex> lock(mutex_);
-        auto sit = sessions_.find(task.sessionId);
-        if (sit != sessions_.end() && sit->second.pendingReset) {
-            sit->second.pendingReset = false;
-            ctx->resetAccumulation();
-        }
-    }
+    consumePendingResetLocked(task.sessionId, ctx);
     const int startSample = ctx->nextSample();
     fprintf(stderr, "chunk %s gen%u: cam=(%.2f,%.2f,%.2f) dir=(%.3f,%.3f,%.3f) "
                     "%dx%d spp=%d neeK=%d exp=%.2f\n",
             task.renderId.c_str(), (unsigned)task.generation,
             task.camera.position.x, task.camera.position.y, task.camera.position.z,
             task.camera.direction.x, task.camera.direction.y, task.camera.direction.z,
-            task.width, task.height, task.spp, task.neeK, task.exposure);
+            task.width, task.height, task.spp, task.neeK, task.config.exposure);
     try {
         if (startSample >= task.spp && !task.reencode) {
             // No encode follows this path — mark the record landed so REST
@@ -1099,51 +942,11 @@ void RenderServer::runRenderChunk(const ChunkTask& task, const RenderScheduler::
                          eventJson("render-started", task.renderId, task.sessionId,
                                    task.generation, 0, task.spp, 0.0, 0, task.width, task.height));
 
-        GPURenderArgs args{};
-        args.camera = task.camera;
-        args.width = task.width;
-        args.height = task.height;
-        args.spp = std::max(0, std::min(task.chunkSpp, task.spp - startSample));
-        args.sppBudgetTotal = task.spp;
-        args.pDirect = 0.5f;
-        args.maxDepth = task.maxDepth;
-        args.baseSeed = task.baseSeed;
-        args.neeK = task.neeK;
-        // 自适应逐像素采样（批2）：args.adaptive* 由 sanitize 在 wavefront
-        // 入口校验（adaptiveMin < 每 chunk spp 时才真正启用）。
-        // 已知组合陷阱：自适应收敛像素会把 NL-means 的 varMed/能量统计拖塌
-        // （Sdn 10M、降噪中位数≈0，gain 打满 3.0 也救不回——实测 0.102 vs
-        // 0.279）。自适应只在 OIDN final 降噪可用时启用；否则整链关闭。
-        args.adaptiveMin = task.adaptiveMin;
-        args.adaptiveCheck = task.adaptiveCheck;
-        args.adaptiveThresh = task.adaptiveThresh;
-        if (task.progressive) {
-            const char* o = std::getenv("RENDER_OIDN");
-            if (!(o && o[0] == '1')) args.adaptiveMin = 0;
-        }
-        // 方向太阳与 CLI 同源：session override（/render 的 sunAz/El/Int，
-        // A3）优先，否则 RENDER_SUN_* env rig——Bistro 内景的主直接光，
-        // 缺了它内景整体死黑（Dd 假暗 ~20×）。
-        if (task.sunHas) {
-            if (task.sunInt > 0.0f)
-                applySunParams(args, task.sunAz, task.sunEl, task.sunInt);
-            // sunInt 0 = explicit sun off: leave args.hasSun = 0.
-        } else {
-            applySunFromEnv(args);
-        }
-        // Physical profile knobs (emission/indirect): task channel when a
-        // position-aware profile drove this render; startup-env fallback
-        // otherwise (CLI-parity for presets without profiles).
-        if (task.hasProfile) {
-            args.emissionScale = task.emissionScale;
-            args.indirectScale = task.indirectScale;
-        } else {
-            applyPhysicalEnvFromEnv(args);
-        }
+        GPURenderArgs args = makeRenderArgs(task, startSample);
         std::vector<PerPixelData> output(size_t(task.width) * task.height);
         const bool perfLog = [] {
-            const char* p = std::getenv("RENDER_PERF");
-            return !p || p[0] != '0';
+            const char* pe = std::getenv("RENDER_PERF");
+            return !pe || pe[0] != '0';
         }();
         const auto perfT0 = std::chrono::steady_clock::now();
         renderGPUWavefrontCancelable(args, task.scene->model(), task.scene->skyTexture(),
@@ -1162,20 +965,7 @@ void RenderServer::runRenderChunk(const ChunkTask& task, const RenderScheduler::
         job->progress().averageSpp = double(accumulated);
 
         // 任务超时（设计 12/13）：链超过上限后不再续提交，状态记为 failed。
-        bool timedOut = false;
-        {
-            std::lock_guard<std::mutex> lock(mutex_);
-            auto rit = renders_.find(task.renderId);
-            if (rit != renders_.end()) {
-                const double elapsed = std::chrono::duration<double>(
-                    std::chrono::steady_clock::now() - rit->second.startTime).count();
-                if (elapsed > renderTimeoutSeconds()) {
-                    rit->second.timedOut = true;
-                    timedOut = true;
-                }
-            }
-        }
-        if (timedOut) {
+        if (chunkTimedOutLocked(task.renderId)) {
             publishEvent(task.sessionId,
                          eventJson("render-failed", task.renderId, task.sessionId,
                                    task.generation, accumulated, task.spp,
@@ -1197,80 +987,10 @@ void RenderServer::runRenderChunk(const ChunkTask& task, const RenderScheduler::
         // task.reencode (A2) enqueues with accumulated == startSample —
         // that 0-sample chunk is exactly one encode of the old accumulation.
         const bool productive = accumulated > startSample || task.reencode;
-        if (productive) {
-            EncodeJob job;
-            job.sessionId = task.sessionId;
-            job.renderId = task.renderId;
-            job.generation = task.generation;
-            job.width = task.width;
-            job.height = task.height;
-            job.spp = task.spp;
-            job.accumulatedSpp = accumulated;
-            job.denoise = task.denoise;
-            job.progressive = task.progressive;
-            job.emitCompleted = accumulated >= task.spp || task.reencode;
-            job.exposure = task.exposure;
-            job.warmTint = task.warmTint;
-            job.saturationBoost = task.saturationBoost;
-            job.bloom = task.bloom;
-            job.hasProfile = task.hasProfile;
-            job.wbStrength = task.wbStrength;
-            job.splitKeySun = task.splitKeySun;
-            job.splitWarm = task.splitWarm;
-            job.splitCool = task.splitCool;
-            job.gradeBands = task.gradeBands;
-            job.output = std::move(output);
-            enqueueEncode(std::move(job));
-        }
+        if (productive)
+            enqueueEncode(makeEncodeJob(task, accumulated, std::move(output)));
 
-        // Terminal states (design 4.3): budget met -> completed (the event
-        // comes from the encode path), cancel request -> canceled. Continue
-        // the chain otherwise; FIFO queue + one chunk per job gives natural
-        // round-robin between sessions. (finalBytes was stored by the
-        // encode path's final-chunk branch — the lossless PNG must not be
-        // overwritten by the JPEG preview.)
-        if (accumulated >= task.spp || task.reencode)
-            return;
-        if (job->cancelRequested()) {
-            publishEvent(task.sessionId,
-                         eventJson("render-canceled", task.renderId, task.sessionId,
-                                   task.generation, accumulated, task.spp,
-                                   double(accumulated), 0, task.width, task.height));
-            return;
-        }
-        if (accumulated <= startSample) {
-            publishEvent(task.sessionId,
-                         eventJson("render-failed", task.renderId, task.sessionId,
-                                   task.generation, accumulated, task.spp,
-                                   double(accumulated), 0, task.width, task.height));
-            return;
-        }
-        {
-            std::lock_guard<std::mutex> lock(mutex_);
-            auto it = sessions_.find(task.sessionId);
-            if (it != sessions_.end() && it->second.generation == task.generation) {
-                // Progressive plan (批1): double the chunk size — cumulative
-                // 2,6,14,30,62,126 → first preview lands fast and the encode
-                // count drops ~2x vs a fixed 8spp cadence. Sample seeds are
-                // absolute (design 5.4), so the plan never changes the image.
-                ChunkTask next = task;
-                if (next.progressive)
-                    next.chunkSpp = std::max(2, std::min(
-                        {64, accumulated + 2, next.spp - accumulated}));
-                auto next_ = scheduler_.submit(task.generation, [this, next](const RenderScheduler::Job& job) {
-                    runRenderChunk(next, job);
-                });
-                it->second.activeJob = next_;
-                auto rit = renders_.find(task.renderId);
-                if (rit != renders_.end()) rit->second.job = next_;
-                return;
-            }
-        }
-        // stale chain: a newer camera/generation owns the session
-        publishEvent(task.sessionId,
-                     eventJson("render-canceled", task.renderId, task.sessionId,
-                               task.generation, accumulated, task.spp,
-                               double(accumulated), 0, task.width, task.height));
+        advanceChunkChain(task, job, accumulated, startSample);
     } catch (...) {
         publishEvent(task.sessionId,
                      eventJson("render-failed", task.renderId, task.sessionId,
@@ -1278,6 +998,140 @@ void RenderServer::runRenderChunk(const ChunkTask& task, const RenderScheduler::
                                double(task.ctx->nextSample()), 0, task.width, task.height));
         throw;
     }
+}
+
+// Consume a pending accumulation reset HERE, on the GPU worker: the
+// reset's cudaMemset must not run on an HTTP thread (submitRender only
+// arms the flag), and doing it before reading nextSample guarantees the
+// new chain starts at sample 0 even when it cancelled an in-flight
+// chunk whose final store would otherwise overwrite the counter
+// (measured: a mid-loop cancel left nextSample=6, and the next chain
+// resumed at start=6 with zeroed accumulators -> wrong radiance).
+void RenderServer::consumePendingResetLocked(const std::string& sessionId,
+                                            WavefrontRenderContext* ctx) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    auto sit = sessions_.find(sessionId);
+    if (sit != sessions_.end() && sit->second.pendingReset) {
+        sit->second.pendingReset = false;
+        ctx->resetAccumulation();
+    }
+}
+
+GPURenderArgs RenderServer::makeRenderArgs(const ChunkTask& task, int startSample) {
+    GPURenderArgs args{};
+    args.camera = task.camera;
+    args.width = task.width;
+    args.height = task.height;
+    args.spp = std::max(0, std::min(task.chunkSpp, task.spp - startSample));
+    args.sppBudgetTotal = task.spp;
+    args.pDirect = 0.5f;
+    args.maxDepth = task.maxDepth;
+    args.baseSeed = task.baseSeed;
+    args.neeK = task.neeK;
+    // 自适应逐像素采样（批2）：args.adaptive* 由 sanitize 在 wavefront
+    // 入口校验（adaptiveMin < 每 chunk spp 时才真正启用）。
+    // 已知组合陷阱：自适应收敛像素会把 NL-means 的 varMed/能量统计拖塌
+    // （Sdn 10M、降噪中位数≈0，gain 打满 3.0 也救不回——实测 0.102 vs
+    // 0.279）。自适应只在 OIDN final 降噪可用时启用；否则整链关闭。
+    args.adaptiveMin = task.adaptiveMin;
+    args.adaptiveCheck = task.adaptiveCheck;
+    args.adaptiveThresh = task.adaptiveThresh;
+    if (task.progressive) {
+        const char* o = std::getenv("RENDER_OIDN");
+        if (!(o && o[0] == '1')) args.adaptiveMin = 0;
+    }
+    // 方向太阳与 CLI 同源：session override（/render 的 sunAz/El/Int，
+    // A3）优先，否则 RENDER_SUN_* env rig——Bistro 内景的主直接光，
+    // 缺了它内景整体死黑（Dd 假暗 ~20×）。Physical knobs (emission/
+    // indirect/mip) come from the profile when one drove this render;
+    // startup-env fallback otherwise (CLI parity).
+    applyRenderConfig(args, task.config,
+                      /*sunEnvFallback=*/!task.config.sunHas,
+                      /*physicalEnvFallback=*/!task.hasProfile);
+    return args;
+}
+
+// 任务超时（设计 12/13）：链超过上限后不再续提交，状态记为 failed。
+bool RenderServer::chunkTimedOutLocked(const std::string& renderId) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    auto rit = renders_.find(renderId);
+    if (rit == renders_.end()) return false;
+    const double elapsed = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - rit->second.startTime).count();
+    if (elapsed <= renderTimeoutSeconds()) return false;
+    rit->second.timedOut = true;
+    return true;
+}
+
+RenderServer::EncodeJob RenderServer::makeEncodeJob(const ChunkTask& task, int accumulated,
+                                      std::vector<PerPixelData>&& output) {
+    EncodeJob job;
+    job.sessionId = task.sessionId;
+    job.renderId = task.renderId;
+    job.generation = task.generation;
+    job.width = task.width;
+    job.height = task.height;
+    job.spp = task.spp;
+    job.accumulatedSpp = accumulated;
+    job.denoise = task.denoise;
+    job.progressive = task.progressive;
+    job.emitCompleted = accumulated >= task.spp || task.reencode;
+    job.config = task.config;
+    job.hasProfile = task.hasProfile;
+    job.output = std::move(output);
+    return job;
+}
+
+// Terminal states (design 4.3): budget met -> completed (the event
+// comes from the encode path), cancel request -> canceled. Continue
+// the chain otherwise; FIFO queue + one chunk per job gives natural
+// round-robin between sessions. (finalBytes was stored by the
+// encode path's final-chunk branch — the lossless PNG must not be
+// overwritten by the JPEG preview.)
+void RenderServer::advanceChunkChain(const ChunkTask& task, const RenderScheduler::Job& job,
+                                     int accumulated, int startSample) {
+    if (accumulated >= task.spp || task.reencode)
+        return;
+    if (job->cancelRequested()) {
+        publishEvent(task.sessionId,
+                     eventJson("render-canceled", task.renderId, task.sessionId,
+                               task.generation, accumulated, task.spp,
+                               double(accumulated), 0, task.width, task.height));
+        return;
+    }
+    if (accumulated <= startSample) {
+        publishEvent(task.sessionId,
+                     eventJson("render-failed", task.renderId, task.sessionId,
+                               task.generation, accumulated, task.spp,
+                               double(accumulated), 0, task.width, task.height));
+        return;
+    }
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        auto it = sessions_.find(task.sessionId);
+        if (it != sessions_.end() && it->second.generation == task.generation) {
+            // Progressive plan (批1): double the chunk size — cumulative
+            // 2,6,14,30,62,126 → first preview lands fast and the encode
+            // count drops ~2x vs a fixed 8spp cadence. Sample seeds are
+            // absolute (design 5.4), so the plan never changes the image.
+            ChunkTask next = task;
+            if (next.progressive)
+                next.chunkSpp = std::max(2, std::min(
+                    {64, accumulated + 2, next.spp - accumulated}));
+            auto next_ = scheduler_.submit(task.generation, [this, next](const RenderScheduler::Job& job) {
+                runRenderChunk(next, job);
+            });
+            it->second.activeJob = next_;
+            auto rit = renders_.find(task.renderId);
+            if (rit != renders_.end()) rit->second.job = next_;
+            return;
+        }
+    }
+    // stale chain: a newer camera/generation owns the session
+    publishEvent(task.sessionId,
+                 eventJson("render-canceled", task.renderId, task.sessionId,
+                           task.generation, accumulated, task.spp,
+                           double(accumulated), 0, task.width, task.height));
 }
 
 void RenderServer::encodePreview(const EncodeJob& job) {
@@ -1294,21 +1148,21 @@ void RenderServer::encodePreview(const EncodeJob& job) {
                                                 : 2;
     Photo photo;
     photo.allocate(width, height);
-    photo.exposure = job.exposure;
-    photo.warmTint = job.warmTint;
-    photo.saturationBoost = job.saturationBoost;
+    photo.exposure = job.config.exposure;
+    photo.warmTint = job.config.warmTint;
+    photo.saturationBoost = job.config.saturationBoost;
     // Display grade: position-aware profiles deliver WB / split-tone /
     // grade bands / saturation as task data (parsed at session creation —
     // no setenv on this thread either); sessions without a profile keep
     // the shared env path (CLI parity).
     if (job.hasProfile) {
-        photo.wbStrength = job.wbStrength;
-        photo.splitKeySun = job.splitKeySun;
-        photo.splitWarm = job.splitWarm;
-        photo.splitCool = job.splitCool;
+        photo.wbStrength = job.config.wbStrength;
+        photo.splitKeySun = job.config.splitKeySun;
+        photo.splitWarm = job.config.splitWarm;
+        photo.splitCool = job.config.splitCool;
         photo.gradeBands.clear();
         {
-            std::istringstream gbs(job.gradeBands);
+            std::istringstream gbs(job.config.gradeBands);
             std::string tok;
             while (gbs >> tok) {
                 float l, r, g, b;
@@ -1320,14 +1174,14 @@ void RenderServer::encodePreview(const EncodeJob& job) {
                 }
             }
         }
-        // photo.saturationBoost was set from job.saturationBoost above —
+        // photo.saturationBoost was set from job.config above —
         // the profile/client precedence was already resolved at submit.
     } else {
         // Shared env grade assembly (WB / split-tone / grade bands /
         // RENDER_SATURATION) — identical to the console path. The
         // saturation env only wins when the session still carries the
         // neutral 1.0 (no client slider pinned it).
-        applyRenderGradeEnv(photo, job.saturationBoost == 1.0f);
+        applyRenderGradeEnv(photo, job.config.saturationBoost == 1.0f);
     }
 
     // 精修链降噪（设计 9）：与 console 完全同源的 radiance/G-buffer 填充，
@@ -1377,7 +1231,7 @@ void RenderServer::encodePreview(const EncodeJob& job) {
     // off — the Clum>=1 threshold fires on the sunlit street itself and the
     // blur haze washes the frame.
     bool doBloom = true;
-    if (job.bloom >= 0) doBloom = job.bloom != 0;
+    if (job.config.bloom >= 0) doBloom = job.config.bloom != 0;
     else if (const char* bl = std::getenv("RENDER_BLOOM")) doBloom = bl[0] != '0';
     photo.postProcess(Photo::Full |
                       (doBloom ? Photo::DoBloom : 0) |
@@ -1574,51 +1428,32 @@ std::string RenderServer::route(const std::string& method, const std::string& pa
 }
 
 void RenderServer::handleClient(int clientSocket) {
-    std::string request;
-    char buffer[4096];
-    while (request.size() < 1024 * 1024) {
-        ssize_t count = recv(clientSocket, buffer, sizeof(buffer), 0);
-        if (count <= 0) { close(clientSocket); return; }
-        request.append(buffer, size_t(count));
-        if (request.find("\r\n\r\n") != std::string::npos) break;
+    std::string request, errorResponse;
+    if (!http::readHttpRequest(clientSocket, request, errorResponse)) {
+        if (!errorResponse.empty()) sendAll(clientSocket, errorResponse);
+        close(clientSocket);
+        return;
     }
     if (request.find("Upgrade: websocket") != std::string::npos) {
         // handleWebSocket owns the socket from here (closes it on every path).
         handleWebSocket(clientSocket, request);
         return;
     }
-    size_t lineEnd = request.find("\r\n");
-    size_t headerEnd = request.find("\r\n\r\n");
-    if (lineEnd == std::string::npos || headerEnd == std::string::npos) {
-        sendAll(clientSocket, httpResponse(400, "application/json", R"({"error":"bad_request"})"));
-        close(clientSocket); return;
-    }
-    std::istringstream firstLine(request.substr(0, lineEnd));
-    std::string method, path, version;
-    firstLine >> method >> path >> version;
     // 拆出 query：此前路由不处理 "?..."，事件里的 previewUrl（带 ?seq=）
     // 一直 404 —— 浏览器 overlay 拉到的全是错误响应。
-    std::string query;
-    const size_t qmark = path.find('?');
-    if (qmark != std::string::npos) {
-        query = path.substr(qmark + 1);
-        path = path.substr(0, qmark);
+    const http::RequestHead head = http::parseRequestHead(request);
+    if (!head.valid) {
+        sendAll(clientSocket, httpResponse(400, "application/json", R"({"error":"bad_request"})"));
+        close(clientSocket);
+        return;
     }
-    std::string body = request.substr(headerEnd + 4);
-    int contentLength = 0;
-    std::string length = headerValue(request, "Content-Length");
-    if (!length.empty()) contentLength = std::min(1024 * 1024, std::atoi(length.c_str()));
-    while (int(body.size()) < contentLength) {
-        ssize_t count = recv(clientSocket, buffer, sizeof(buffer), 0);
-        if (count <= 0) break;
-        body.append(buffer, size_t(count));
-    }
+    const std::string body = request.substr(request.find("\r\n\r\n") + 4);
     // 访问 token（设计 13）：Authorization: Bearer 或 ?token=（WS/<img> 走 query）。
     // /api/health 保持开放供存活探测。
-    if (path != "/api/health") {
+    if (head.path != "/api/health") {
         std::string given = headerValue(request, "Authorization");
         if (given.rfind("Bearer ", 0) == 0) given = given.substr(7);
-        if (given.empty()) given = queryParam(query, "token");
+        if (given.empty()) given = queryParam(head.query, "token");
         if (given != token_) {
             sendAll(clientSocket, httpResponse(401, "application/json",
                                                R"({"error":"unauthorized"})"));
@@ -1628,7 +1463,8 @@ void RenderServer::handleClient(int clientSocket) {
     }
     int status = 200;
     std::string type;
-    sendAll(clientSocket, httpResponse(status, type, route(method, path, body, status, type)));
+    sendAll(clientSocket,
+            httpResponse(status, type, route(head.method, head.path, body, status, type)));
     close(clientSocket);
 }
 
@@ -1647,8 +1483,8 @@ std::string RenderServer::renderStatus(const std::string& renderId, int& status)
                                       : stateName(record.job->state());
     if (state == "completed" && !record.encoded) state = "running";
     std::ostringstream body;
-    body << "{\"renderId\":\"" << renderId
-         << "\",\"sessionId\":\"" << record.sessionId
+    body << "{\"renderId\":\"" << jsonEscape(renderId)
+         << "\",\"sessionId\":\"" << jsonEscape(record.sessionId)
          << "\",\"generation\":" << record.generation
          << ",\"state\":\"" << state << "\""
          << ",\"sample\":" << record.job->progress().sample
@@ -1693,18 +1529,9 @@ std::string RenderServer::renderImage(const std::string& renderId, bool finalIma
 
 bool RenderServer::handleWebSocket(int clientSocket, const std::string& request) {
     // Path validation (design 8): only /api/sessions/{id}/events upgrades.
-    std::string path, query;
-    {
-        const size_t lineEnd = request.find("\r\n");
-        std::istringstream firstLine(request.substr(0, lineEnd));
-        std::string method, version;
-        firstLine >> method >> path >> version;
-        const size_t qmark = path.find('?');
-        if (qmark != std::string::npos) {
-            query = path.substr(qmark + 1);
-            path = path.substr(0, qmark);
-        }
-    }
+    const http::RequestHead head = http::parseRequestHead(request);
+    const std::string& path = head.path;
+    const std::string& query = head.query;
     const std::string eventsPrefix = "/api/sessions/";
     const std::string eventsSuffix = "/events";
     std::string sessionId;
@@ -1750,7 +1577,7 @@ bool RenderServer::handleWebSocket(int clientSocket, const std::string& request)
         close(clientSocket);
         return false;
     }
-    const std::string accept = sha1Base64(key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11");
+    const std::string accept = http::webSocketAccept(key);
     const std::string response =
         "HTTP/1.1 101 Switching Protocols\r\n"
         "Upgrade: websocket\r\nConnection: Upgrade\r\n"
@@ -1801,74 +1628,16 @@ bool RenderServer::handleWebSocket(int clientSocket, const std::string& request)
         if (!alive) break;
 
         // read one client frame (masked; only Ping/Close are interpreted)
-        unsigned char header[2] = {0, 0};
-        size_t headerGot = 0;
-        bool idle = false;
-        while (headerGot < 2) {
-            const ssize_t n = recv(clientSocket, header + headerGot, 2 - headerGot, 0);
-            if (n <= 0) {
-                if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)) {
-                    if (headerGot == 0) { idle = true; break; }
-                    continue;   // partial header: retry the same frame
-                }
-                headerGot = 99;
-                break;
-            }
-            headerGot += size_t(n);
-        }
-        if (idle) continue;
-        if (headerGot != 2) break;
+        http::WebSocketFrame frame;
+        const http::FrameRead rc =
+            http::readWebSocketFrame(clientSocket, frame, kMaxClientPayload);
+        if (rc == http::FrameRead::idle) continue;
+        if (rc == http::FrameRead::error) break;
 
-        const unsigned char opcode = header[0] & 0x0f;
-        const bool masked = (header[1] & 0x80) != 0;
-        uint64_t payloadLen = header[1] & 0x7f;
-        if (payloadLen == 126) {
-            unsigned char ext[2] = {0, 0};
-            if (recv(clientSocket, ext, 2, 0) != 2) break;
-            payloadLen = (uint64_t(ext[0]) << 8) | ext[1];
-        } else if (payloadLen == 127) {
-            unsigned char ext[8] = {0};
-            if (recv(clientSocket, ext, 8, 0) != 8) break;
-            payloadLen = 0;
-            for (int i = 0; i < 8; ++i) payloadLen = (payloadLen << 8) | ext[i];
-        }
-        if (payloadLen > kMaxClientPayload) break;
-
-        unsigned char mask[4] = {0, 0, 0, 0};
-        if (masked && recv(clientSocket, mask, 4, 0) != 4) break;
-        std::vector<unsigned char> payload((size_t(payloadLen)));
-        size_t got = 0;
-        while (got < payload.size()) {
-            const ssize_t n = recv(clientSocket, payload.data() + got,
-                                   payload.size() - got, 0);
-            if (n <= 0) {
-                if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR))
-                    continue;
-                got = payload.size() + 1;
-                break;
-            }
-            got += size_t(n);
-        }
-        if (got != payload.size()) break;
-        if (masked)
-            for (size_t i = 0; i < payload.size(); ++i)
-                payload[i] ^= mask[i % 4];
-
-        if (opcode == 0x8) break;   // Close
-        if (opcode == 0x9) {        // Ping -> Pong (echo payload)
-            std::string pong;
-            pong.push_back(char(0x8a));
-            if (payload.size() < 126) {
-                pong.push_back(char(payload.size()));
-            } else if (payload.size() <= 0xffff) {
-                pong.push_back(126);
-                pong.push_back(char((payload.size() >> 8) & 0xff));
-                pong.push_back(char(payload.size() & 0xff));
-            } else {
-                break;
-            }
-            pong += std::string(payload.begin(), payload.end());
-            if (!sendAll(clientSocket, pong)) alive = false;
+        if (frame.opcode == 0x8) break;   // Close
+        if (frame.opcode == 0x9) {        // Ping -> Pong (echo payload)
+            if (!http::sendWebSocketControl(clientSocket, 0x0A, frame.payload))
+                alive = false;
         }
         // client text/binary frames are not interpreted in this version
     }

@@ -34,6 +34,13 @@ public:
     bool load(const std::string& filename);
     bool loadDDS(const std::string& filename);
     void bakeAverageTexel();
+    // Rebuild levels 1..N with box averaging in the pow(2.2) domain — the
+    // domain the GPU shader decodes baseColor/emission texels in. Averaging
+    // raw sRGB bytes biases every mip darker (Jensen: mean(s^2.2) >=
+    // mean(s)^2.2 — measured as a 9% interior luma drop). Data maps
+    // (normal/roughness/metallic) keep the linear-byte chain: their texels
+    // are not gamma-decoded at sampling time.
+    void rebuildMipmapsSrgb(float gamma = 2.2f);
     float4 sample(float u, float v, float mipLevel = 0.0f) const;
     bool hasAlpha() const;
     // Luminance-preserving desaturation of the stored RGB data + re-bake of
@@ -45,6 +52,15 @@ public:
     int getHeight() const { return height; }
     int getChannels() const { return channels; }
     const uint8_t* getData() const { return data.data(); }
+
+    // GPU mipmap chain access (P0 texture clarity fix): levels 1..N built by
+    // generateMipmaps() at load, RGBA8, for trilinear sampling in-kernel.
+    // Level 0 stays in its native storage (BC blocks or RGBA8) — the chain
+    // is the coarser tail only.
+    int getMipLevels() const { return int(mipmaps.size()); }
+    int getMipWidth(int level) const { return mipmaps[level - 1].width; }
+    int getMipHeight(int level) const { return mipmaps[level - 1].height; }
+    const uint8_t* getMipData(int level) const { return mipmaps[level - 1].data.data(); }
 
     // Debug/dedup helpers
     const std::string& getDebugName() const { return m_debugName; }
@@ -172,4 +188,26 @@ struct GPUMaterialBuffer {
     // texData (BC blocks or RGBA8 texels), with [numTextures] holding the end.
     int*    texFormats;     // [numTextures]
     long long* texByteOffsets; // [numTextures + 1] (bytes — can exceed 2^31)
+
+    // P0 mipmap chain (texture clarity): levels 1..N of every texture, RGBA8,
+    // concatenated in mipData; per-texture byte ranges in mipByteOffsets
+    // (prefix, [numTextures+1]); per-texture level counts in mipLevels
+    // (0 = no chain → sampling falls back to level 0 = byte-identical old
+    // path). Level dimensions are mipWidths/mipHeights as FLAT per-level
+    // arrays indexed by mipLevelStart[t]+(level-1) — kept simple: we store
+    // them per level in a parallel flat layout.
+    unsigned char* mipData = nullptr;         // RGBA8 texels, all levels
+    long long*     mipByteOffsets = nullptr;  // [numTextures + 1]
+    int*           mipLevels = nullptr;       // [numTextures] chain length (0..N)
+    int*           mipWidths = nullptr;       // [totalMipLevels] per-level width
+    int*           mipHeights = nullptr;      // [totalMipLevels] per-level height
+    int*           mipLevelStart = nullptr;   // [numTextures+1] index into widths
+    // ---- P0 diagnostics: LOD distribution probe (RENDER_MIP_PROBE=texId) ----
+    // When set, gpu_textureLod atomicMax-es the per-axis texel-footprint
+    // ratios of that texture so the host can see whether the analytic LOD
+    // ever reaches the deep levels (0 = disabled).
+    int            mipProbe = 0;
+    int            mipProbeTexId = -1;
+    float*         mipProbeMaxU = nullptr;    // device float
+    float*         mipProbeMaxV = nullptr;    // device float
 };

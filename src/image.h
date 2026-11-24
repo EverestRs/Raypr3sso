@@ -134,6 +134,24 @@ public:
     std::vector<uint8_t> rgbBytes() const;
 
 private:
+    // postProcess stages. Pure extraction: same order, same numerics.
+    bool denoiseRadiance(int sppEff, int denoiseQuality);  // true when filtered
+    void denoiseEmission();
+    void recompositeFinal();
+    void finishDisplay(int shadeOptions);
+    // denoiseRadiance stages. Same extraction rule: n / aovs rebuilt per
+    // stage, conditions and numerics moved verbatim.
+    void denoiseStatistics(double& rawLumSum, float& lumScale);
+    void buildSunliness();                      // P1/P2 sun-key matte
+#ifdef RENDERER_HAS_OIDN
+    void runOidnPass(int denoiseQuality);       // P4c OIDN alternative
+#endif
+    void nlMeansFilter(size_t n, float lumScale, float ffGate, bool nlMeans,
+                       int nlPasses, int denoiseQuality);
+    void applyPositionAO(size_t n);             // P4a contact shadows
+    void albedoDetailTransfer(size_t n);        // multi-scale detail pyramid
+    void applyEnergyGain(size_t n, double rawLumSum, float lumScale,
+                         float kSpp, bool nlMeans, int sppEff);
     void tonemap();        // Reinhard / ACES
     void gammaCorrect();   // sRGB
     void bloom();

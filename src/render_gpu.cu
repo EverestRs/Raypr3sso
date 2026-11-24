@@ -2,9 +2,9 @@
 #include "sampling.h"
 #include "bvh_gpu.h"
 #include "progress.h"
-// Include the implementation to avoid cross-file device function calls
-// (we disable separable compilation so the device linker doesn't strip PTX)
-#include "bvh_gpu.cu"
+// The implementation files bvh_gpu.cu / render_wavefront.cu are included
+// from src/cuda_tu.cu (single-TU device linking; separable compilation is
+// disabled so the device linker keeps the sm_70 PTX).
 #include "../include/math_utils.h"
 #include <cstdio>
 #include <cuda_runtime.h>
@@ -166,22 +166,42 @@ bool applySunParams(GPURenderArgs& args, float az, float el, float inten) {
 
 bool applySunFromEnv(GPURenderArgs& args) {
     // Directional sun (art-directed window light, RENDER_SUN_*).
-    const char* se = std::getenv("RENDER_SUN_INT");
-    if (!se || std::strtof(se, nullptr) <= 0.0f) return false;
-    float az = 0.0f, el = 45.0f, inten = std::strtof(se, nullptr);
-    if (const char* a = std::getenv("RENDER_SUN_AZ")) az = std::strtof(a, nullptr);
-    if (const char* e = std::getenv("RENDER_SUN_EL")) el = std::strtof(e, nullptr);
-    return applySunParams(args, az, el, inten);
+    RenderConfig cfg;
+    if (!sunFromEnv(cfg)) return false;
+    return applySunParams(args, cfg.sunAz, cfg.sunEl, cfg.sunInt);
 }
 
 // Per-render physical env knobs shared by both hosts (console + server):
 // the server fills these from its parsed RigProfile instead (task channel),
 // so env is only the CLI/startup-rig fallback path.
 void applyPhysicalEnvFromEnv(GPURenderArgs& args) {
-    if (const char* is = std::getenv("RENDER_INDIRECT_SCALE"))
-        args.indirectScale = fmaxf(0.0f, std::strtof(is, nullptr));
-    if (const char* es = std::getenv("RENDER_EMISSION_SCALE"))
-        args.emissionScale = fmaxf(0.0f, std::strtof(es, nullptr));
+    RenderConfig cfg;
+    physicalFromEnv(cfg);
+    args.indirectScale = cfg.indirectScale;
+    args.emissionScale = cfg.emissionScale;
+    args.useMipmaps = cfg.useMipmaps;
+    args.anisoMax = cfg.anisoMax;
+    args.lodScale = cfg.lodScale;
+}
+
+void applyRenderConfig(GPURenderArgs& args, const RenderConfig& config,
+                       bool sunEnvFallback, bool physicalEnvFallback) {
+    if (config.sunHas) {
+        if (config.sunInt > 0.0f)
+            applySunParams(args, config.sunAz, config.sunEl, config.sunInt);
+        // sunInt == 0 = explicit sun off: leave args.hasSun = 0.
+    } else if (sunEnvFallback) {
+        applySunFromEnv(args);
+    }
+    if (physicalEnvFallback) {
+        applyPhysicalEnvFromEnv(args);
+    } else {
+        args.indirectScale = config.indirectScale;
+        args.emissionScale = config.emissionScale;
+        args.useMipmaps = config.useMipmaps;
+        args.anisoMax = config.anisoMax;
+        args.lodScale = config.lodScale;
+    }
 }
 
 // Foliage shadow transmission (RENDER_LEAF_SHADOW_TINT, default 1.0):
@@ -766,15 +786,196 @@ __device__ inline float4 gpu_sampleTexture(int texId, float u, float v,
     return result;
 }
 
+// ---- P0 mipmap chain sampling ----
+// Bilinear tap on one RGBA8 mip level. A texture's levels are packed
+// contiguously in mb.mipData starting at mipByteOffsets[texId]; level dims
+// live in the flat mipWidths/mipHeights arrays indexed by
+// mipLevelStart[texId] + (level-1). Returns false when the level is absent.
+__device__ inline bool gpu_sampleMipLevel(int texId, float u, float v, int level,
+                                          const GPUMaterialBuffer& mb, float4& out) {
+    const int start = mb.mipLevelStart[texId];
+    const int cnt = mb.mipLevels[texId];
+    if (level < 1 || level > cnt) return false;
+    const int w = mb.mipWidths[start + level - 1];
+    const int h = mb.mipHeights[start + level - 1];
+    if (w <= 0 || h <= 0) return false;
+    u = u - floorf(u); v = v - floorf(v);
+    const float fx = u * w - 0.5f;
+    const float fy = v * h - 0.5f;
+    const int ix = int(floorf(fx));
+    const int iy = int(floorf(fy));
+    const float tx = fx - floorf(fx);
+    const float ty = fy - floorf(fy);
+    const int x0 = (ix + w) % w; int x1 = (ix + 1 + w) % w;
+    const int y0 = (iy + h) % h; int y1 = (iy + 1 + h) % h;
+    long long off = mb.mipByteOffsets[texId];
+    for (int l = 0; l < level - 1; ++l)
+        off += (long long)mb.mipWidths[start + l] * mb.mipHeights[start + l] * 4;
+    const uchar4* lm = reinterpret_cast<const uchar4*>(mb.mipData + off);
+    const uchar4 c00 = lm[y0 * w + x0], c10 = lm[y0 * w + x1];
+    const uchar4 c01 = lm[y1 * w + x0], c11 = lm[y1 * w + x1];
+    out.x = ((c00.x*(1-tx) + c10.x*tx)*(1-ty) + (c01.x*(1-tx) + c11.x*tx)*ty) / 255.0f;
+    out.y = ((c00.y*(1-tx) + c10.y*tx)*(1-ty) + (c01.y*(1-tx) + c11.y*tx)*ty) / 255.0f;
+    out.z = ((c00.z*(1-tx) + c10.z*tx)*(1-ty) + (c01.z*(1-tx) + c11.z*tx)*ty) / 255.0f;
+    out.w = ((c00.w*(1-tx) + c10.w*tx)*(1-ty) + (c01.w*(1-tx) + c11.w*tx)*ty) / 255.0f;
+    return true;
+}
+
+// LOD-aware trilinear sample: level 0 = the original bilinear path (BC or
+// RGBA8), levels 1.. = the RGBA8 chain, lerped between nearest levels.
+// lod <= 0.5 or no chain → exactly the old path (byte-identical).
+// anisoTaps > 1: taps along the coarse texture axis (span in UV units).
+// IMPORTANT: the span is passed in UV units, but the level-0 BC path
+// interprets u/v as RAW texels (no division by w/h) — so for level-0 taps
+// the span must be multiplied by the texture size there. The mip path
+// normalizes u/v itself.
+// anisoTaps > 1: taps along the coarse texture axis (span in UV units).
+// gamma: the DECODE gamma of this texture (2.2 baseColor, emissionGamma for
+// emission maps, 1 = raw data). Multi-tap averages are formed in that decode
+// domain and re-encoded — averaging encoded sRGB bytes biases dark (Jensen:
+// mean(s^g) >= mean(s)^g), which showed up as a ~6% interior luma loss on
+// the grazing floor where the tap count peaks.
+__device__ inline float4 gpu_sampleTextureMip(int texId, float u, float v, float lod,
+                                              const GPUMaterialBuffer& mb,
+                                              float anisoTaps = 1.0f,
+                                              float anisoSpanU = 0.0f,
+                                              float anisoSpanV = 0.0f,
+                                              float gamma = 1.0f) {
+    float4 c0 = gpu_sampleTexture(texId, u, v, mb);
+    if (lod <= 0.5f || !mb.mipData || !mb.mipLevels || !mb.mipWidths ||
+        !mb.mipHeights || !mb.mipByteOffsets || !mb.mipLevelStart ||
+        texId < 0 || texId >= mb.numTextures)
+        return c0;
+    const int maxLod = mb.mipLevels[texId];
+    if (maxLod <= 0) return c0;
+    const float lf = fminf(fmaxf(lod, 0.0f), float(maxLod));
+    const int taps = anisoTaps > 1.0f ? min(4, int(anisoTaps)) : 1;
+    const bool domain = (taps > 1 && gamma > 1.01f);
+    const float invG = 1.0f / fmaxf(gamma, 1e-3f);
+    float4 acc = make_float4(0,0,0,0);
+    for (int i = 0; i < taps; ++i) {
+        const float s = taps > 1 ? ((float(i) + 0.5f) / float(taps) - 0.5f) : 0.0f;
+        float4 a, b;
+        const int l0 = int(floorf(lf));
+        const int l1 = (l0 + 1 <= maxLod) ? l0 + 1 : l0;
+        const float blend = lf - float(l0);
+        // level-0 taps: raw texel offsets; mip taps: normalized UV offsets
+        const float rawW = float(mb.texDataWidths[texId]);
+        const float rawH = float(mb.texDataHeights[texId]);
+        const float u0 = u + s * anisoSpanU * rawW;
+        const float v0 = v + s * anisoSpanV * rawH;
+        const float um = u + s * anisoSpanU;
+        const float vm = v + s * anisoSpanV;
+        if (l0 == 0) { a = gpu_sampleTexture(texId, u0, v0, mb); }
+        else if (!gpu_sampleMipLevel(texId, um, vm, l0, mb, a)) return c0;
+        if (l1 == 0) { b = gpu_sampleTexture(texId, u0, v0, mb); }
+        else if (!gpu_sampleMipLevel(texId, um, vm, l1, mb, b)) b = a;
+        float4 t4;
+        t4.x = a.x + (b.x - a.x) * blend;
+        t4.y = a.y + (b.y - a.y) * blend;
+        t4.z = a.z + (b.z - a.z) * blend;
+        t4.w = a.w + (b.w - a.w) * blend;
+        if (domain) {
+            t4.x = powf(fmaxf(t4.x, 0.0f), gamma);
+            t4.y = powf(fmaxf(t4.y, 0.0f), gamma);
+            t4.z = powf(fmaxf(t4.z, 0.0f), gamma);
+        }
+        acc.x += t4.x / float(taps);
+        acc.y += t4.y / float(taps);
+        acc.z += t4.z / float(taps);
+        acc.w += t4.w / float(taps);
+    }
+    if (domain) {
+        acc.x = powf(fmaxf(acc.x, 0.0f), invG);
+        acc.y = powf(fmaxf(acc.y, 0.0f), invG);
+        acc.z = powf(fmaxf(acc.z, 0.0f), invG);
+    }
+    return acc;
+}
+
+// Analytic texture LOD (isotropic, conservative max-axis): the world-space
+// pixel footprint at the hit divided by the texel world size, log2. The
+// Jacobian comes from the triangle's UV/position edges (same construction
+// as gpu_sampleNormalMap's tangent frame); the footprint from the hit
+// distance × the pixel angular size / |cos(incidence)|. Returns 0 (= old
+// path) whenever the chain or the Jacobian is unavailable.
+// Outputs (when lod > 0): anisoTaps (1/2/4) + the coarse-axis UV span for
+// the anisotropic filter taps in gpu_sampleTextureMip.
+__device__ inline float gpu_textureLod(const float3& v0, const float3& v1, const float3& v2,
+                                       const float2& uv0, const float2& uv1, const float2& uv2,
+                                       const float3& rayOrigin, const float3& rayDir,
+                                       const float3& pos, const float3& geomNormal,
+                                       const GPUMaterialBuffer& mb, int texId,
+                                       float angularPixel, float anisoMax,
+                                       float args_lodScale,
+                                       float& anisoTaps, float& spanU, float& spanV) {
+    anisoTaps = 1.0f; spanU = 0.0f; spanV = 0.0f;
+    if (texId < 0 || texId >= mb.numTextures) return 0.0f;
+    if (!mb.mipData || !mb.mipLevels || mb.mipLevels[texId] <= 0) return 0.0f;
+    if (!mb.texDataWidths || mb.texDataWidths[texId] <= 0) return 0.0f;
+    const float3 e1 = v1 - v0, e2 = v2 - v0;
+    const float2 u1 = uv1 - uv0, u2 = uv2 - uv0;
+    const float det = u1.x * u2.y - u1.y * u2.x;
+    if (fabsf(det) < 1e-12f) return 0.0f;
+    const float inv = 1.0f / det;
+    const float3 dPdu = (e1 * u2.y - e2 * u1.y) * inv;   // world units per UV
+    const float3 dPdv = (e2 * u1.x - e1 * u2.x) * inv;
+    const float texW = float(mb.texDataWidths[texId]);
+    const float texH = float(mb.texDataHeights[texId]);
+    const float texelU = fmaxf(length(dPdu) / texW, 1e-8f);
+    const float texelV = fmaxf(length(dPdv) / texH, 1e-8f);
+    const float t = length(pos - rayOrigin);
+    const float cosI = fmaxf(fabsf(dot(rayDir, geomNormal)), 0.05f);
+    // Pixel footprint on the tilted surface is an ANISOTROPIC ellipse:
+    // the fine axis (perpendicular to the view/normal plane) is t·Δθ,
+    // the coarse axis (in that plane) is stretched by 1/cosI. Dividing
+    // BOTH axes by cosI (the previous form) over-estimated the fine axis
+    // by 1/cosI — ~2 mip levels on grazing floors, erasing the pattern.
+    const float f0 = t * angularPixel;
+    const float rU0 = f0 / texelU, rV0 = f0 / texelV;
+    const float rMin = fmaxf(fminf(rU0, rV0), 1e-6f);
+    const float rMax = fmaxf(rU0, rV0) / cosI;
+    if (mb.mipProbe && texId == mb.mipProbeTexId) {
+        atomicMax(reinterpret_cast<int*>(mb.mipProbeMaxU), __float_as_int(rU0));
+        atomicMax(reinterpret_cast<int*>(mb.mipProbeMaxV), __float_as_int(rV0));
+    }
+    if (rMax <= 1.0f) return 0.0f;
+    // Anisotropy ratio: how much longer the coarse axis is than the fine.
+    const float aniso = sqrtf(rMax / rMin);
+    // LOD from the FINE axis (rMin) — the coarse axis is handled by taps,
+    // not by blurring (standard aniso mip selection). rMin is already
+    // "footprint vs level-0 texel", which is exactly the mip level
+    // definition; no extra terms belong here.
+    float lod = log2f(fmaxf(rMin, 1.0f)) * args_lodScale;
+    if (aniso > anisoMax) {
+        // beyond the tap cap, blur the fine axis so the coarse axis fits
+        lod = fmaxf(lod, log2f(fmaxf(rMax / anisoMax, 1.0f)) * args_lodScale);
+    }
+    // taps: along the coarse axis when within the aniso cap; when the cap
+    // forces the LOD deeper, the chain already covers both axes → 1 tap.
+    if (aniso <= anisoMax) {
+        if (aniso > 2.0f)      anisoTaps = 4.0f;
+        else if (aniso > 1.4f) anisoTaps = 2.0f;
+    }
+    // coarse-axis span in UV units: the taps spread across the FULL
+    // coarse-axis footprint rMax (level-0 texels), spacing rMax/taps —
+    // standard aniso filtering. (Spreading only across rMax/anisoMax
+    // under-covers the coarse axis and forces the level itself deeper.)
+    const float spanUV = rMax;
+    if (rU0 > rV0) spanU = spanUV / texW; else spanV = spanUV / texH;
+    lod = fminf(lod, float(mb.mipLevels[texId]));
+    return lod;
+}
+
 // Sample a normal map and transform from tangent space to world space.
 __device__ inline float3 gpu_sampleNormalMap(int texId, float u, float v,
                                               const float3& shadingNormal,
                                               const GPUModelData& model,
-                                              int triBase) {
+                                              int triBase, float lod = 0.0f) {
     if (texId < 0) return shadingNormal;
 
     const GPUMaterialBuffer& mb = model.materials;
-    float4 nmap = gpu_sampleTexture(texId, u, v, mb);
+    float4 nmap = gpu_sampleTextureMip(texId, u, v, lod, mb);
     // Decode normal from [0,1] to [-1,1]
     float3 tangentNormal = make_float3(
         nmap.x * 2.0f - 1.0f,
@@ -814,7 +1015,10 @@ __device__ inline float3 gpu_sampleNormalMap(int texId, float u, float v,
 // =========================================================================
 __device__ HitInfo gpu_getHitInfo(const Ray& ray, const HitRecord& hit,
                                    const GPUModelData& model,
-                                   float emissionScale) {
+                                   float emissionScale,
+                                   float angularPixel = 0.0f, int useMipmaps = 0,
+                                   float anisoMax = 2.0f, float lodScale = 1.0f,
+                                   bool fineGuide = false) {
     const int faceIdx = hit.faceIdx;
     const int triBase = faceIdx * 3;
 
@@ -883,25 +1087,39 @@ __device__ HitInfo gpu_getHitInfo(const Ray& ray, const HitRecord& hit,
         }
     }
 
-    // Sample textures
-    float4 bcTex = gpu_sampleTexture(mb.baseColorTexIds[matId], uv.x, uv.y, mb);
+    // Sample textures. P0 mipmap chain: when RENDER_MIPMAP=1, the analytic
+    // LOD (isotropic, conservative max-axis) selects the mip level; lod 0
+    // or no chain = the original bilinear path, byte-identical. The LOD is
+    // computed from the baseColor texture (the maps of one material share
+    // UV space; their own level counts are clamped per-texture inside
+    // gpu_sampleTextureMip).
+    float texLod = 0.0f, anisoTaps = 1.0f, spanU = 0.0f, spanV = 0.0f;
+    if (useMipmaps && angularPixel > 0.0f)
+        texLod = gpu_textureLod(v0, v1, v2, uv0, uv1, uv2, ray.origin, ray.direction,
+                                pos, geomNormal, mb, mb.baseColorTexIds[matId],
+                                angularPixel, anisoMax, lodScale, anisoTaps, spanU, spanV);
+    float4 bcTex = gpu_sampleTextureMip(mb.baseColorTexIds[matId], uv.x, uv.y, texLod, mb,
+                                        anisoTaps, spanU, spanV, 2.2f);
     const int specFlag = mb.packedSpecFlags ? mb.packedSpecFlags[matId] : 0;
     bool packedSpec = (specFlag == 1);   // G channel = roughness
     bool glossSpec  = (specFlag == 2);   // G channel = glossiness (rough = 1-G)
     float roughnessVal = mb.roughnessFactors[matId];
     if (mb.roughnessTexIds[matId] >= 0) {
-        float4 rt = gpu_sampleTexture(mb.roughnessTexIds[matId], uv.x, uv.y, mb);
+        float4 rt = gpu_sampleTextureMip(mb.roughnessTexIds[matId], uv.x, uv.y, texLod, mb,
+                                         anisoTaps, spanU, spanV);
         // Packed SPECULAR format: roughness in G channel
         roughnessVal = packedSpec ? rt.y : (glossSpec ? 1.0f - rt.y : rt.x);
     }
     float metallicVal = mb.metallicFactors[matId];
     if (mb.metallicTexIds[matId] >= 0) {
-        float4 mt = gpu_sampleTexture(mb.metallicTexIds[matId], uv.x, uv.y, mb);
+        float4 mt = gpu_sampleTextureMip(mb.metallicTexIds[matId], uv.x, uv.y, texLod, mb,
+                                         anisoTaps, spanU, spanV);
         metallicVal = mt.x;  // Metallic in R channel (or G for some maps)
         if (metallicVal < 0.01f && mt.y > 0.01f) metallicVal = mt.y;  // Fallback
     } else if (packedSpec && mb.roughnessTexIds[matId] >= 0) {
         // Packed SPECULAR format: metallic in B channel
-        float4 rt = gpu_sampleTexture(mb.roughnessTexIds[matId], uv.x, uv.y, mb);
+        float4 rt = gpu_sampleTextureMip(mb.roughnessTexIds[matId], uv.x, uv.y, texLod, mb,
+                                         anisoTaps, spanU, spanV);
         metallicVal = fminf(rt.z, 0.99f);
     }
 
@@ -909,7 +1127,7 @@ __device__ HitInfo gpu_getHitInfo(const Ray& ray, const HitRecord& hit,
     float3 finalNormal = shadingNormal;
     if (mb.normalTexIds[matId] >= 0) {
         finalNormal = gpu_sampleNormalMap(mb.normalTexIds[matId], uv.x, uv.y,
-                                           shadingNormal, model, triBase);
+                                           shadingNormal, model, triBase, texLod);
     }
 
     HitInfo info;
@@ -927,6 +1145,19 @@ __device__ HitInfo gpu_getHitInfo(const Ray& ray, const HitRecord& hit,
     info.baseColor = texColor * bcf;
     if (dot(info.baseColor, info.baseColor) < 1e-8f)
         info.baseColor = bcf;
+    // Denoiser-guide albedo at full detail: when the shading fetch was
+    // mip-filtered (grazing / distant surfaces), re-sample level 0. Only
+    // the first hit pays this (fineGuide = depth 0) — the G-buffer guide
+    // must carry the full texture band or the multi-scale detail transfer
+    // has nothing to restore (measured ceiling with a filtered guide).
+    info.baseColorFine = info.baseColor;
+    if (fineGuide && texLod > 0.01f && mb.baseColorTexIds[matId] >= 0) {
+        const float4 fineTex = gpu_sampleTexture(mb.baseColorTexIds[matId],
+                                                 uv.x, uv.y, mb);
+        const float3 fineLin = gpu_toLinear(make_float3(fineTex.x, fineTex.y, fineTex.z));
+        const float3 fineAlb = fineLin * bcf;
+        if (dot(fineAlb, fineAlb) > 1e-8f) info.baseColorFine = fineAlb;
+    }
     // Emissive texture sampling (GPU path): if an emissive texture exists, use it
     // to modulate the emission factor, giving lamps their patterned appearance
     // instead of uniform white blobs. Emission maps are sRGB too.
@@ -936,12 +1167,14 @@ __device__ HitInfo gpu_getHitInfo(const Ray& ray, const HitRecord& hit,
     // (factor x scale) x emCol order bit-for-bit at scale=1.
     info.emission = mb.emissionFactors[matId] * emissionScale;
     if (mb.emissionTexIds[matId] >= 0) {
-        float4 emTex = gpu_sampleTexture(mb.emissionTexIds[matId], uv.x, uv.y, mb);
         // Emissive contrast gamma 5 — matches the bakeAverageTexel domain and
         // the flux-compensated emissionFactor (see model.cpp). Keeps bulb
-        // pixels white while map mid-grays (frames/stems) stay dark.
+        // pixels white while map mid-grays (frames/stems) stay dark. The
+        // mip taps average in this same decode domain.
         float emG = (model.materials.emissionGamma && matId < model.materials.numMaterials)
                   ? model.materials.emissionGamma[matId] : 5.0f;
+        float4 emTex = gpu_sampleTextureMip(mb.emissionTexIds[matId], uv.x, uv.y, texLod, mb,
+                                            anisoTaps, spanU, spanV, emG);
         float3 emCol = make_float3(powf(emTex.x, emG),
                                    powf(emTex.y, emG),
                                    powf(emTex.z, emG));
@@ -1009,7 +1242,10 @@ __device__ float gpu_sunConeMask(float3 d, float3 sunDir, float halfRad) {
 // Skybox importance sampling: skyCDF is the luminance CDF on GPU (length = skyW*skyH+1)
 __device__ float3 gpu_transparentShadow(float3 org, float3 dir, float maxDist,
                                         const GPUModelData& model,
-                                        bool& blocked) {
+                                        bool& blocked,
+                                        float angularPixel = 0.0f, int useMipmaps = 0,
+                                        float anisoMax = 2.0f, float lodScale = 1.0f,
+                                   bool fineGuide = false) {
     float3 T = make_float3(1.0f, 1.0f, 1.0f);
     blocked = false;
     float remaining = maxDist;
@@ -1034,8 +1270,11 @@ __device__ float3 gpu_transparentShadow(float3 org, float3 dir, float maxDist,
             }
         }
         // Shadow helper: emission is not consumed on this path (opacity/
-        // normal/eta only) — the scale arg is inert here.
-        HitInfo hs = gpu_getHitInfo(Ray(org, dir), h, model, 1.0f);
+        // normal/eta only) — the scale arg is inert here. The LOD matters
+        // for alpha-cutout foliage: mip-averaged alpha at distance keeps
+        // canopies from aliasing into dapple holes the denoiser then smears.
+        HitInfo hs = gpu_getHitInfo(Ray(org, dir), h, model, 1.0f,
+                                    angularPixel, useMipmaps, anisoMax);
         // Alpha-cutout foliage: texels with alpha < 0.5 are holes — the shadow
         // ray passes through, matching the camera-path cutout branch (otherwise
         // canopies would punch holes for camera rays but cast solid shadows).
@@ -1103,119 +1342,66 @@ __device__ void gpu_pathInit(GPUPathState& st, uint32_t seed, const Ray& inRay) 
     st.alive = 1;
 }
 
-__device__ __noinline__ bool gpu_shadeBounce(
-    GPUPathState&    st,
-    PerPixelData&    split,
-    const HitRecord& hit,
-    const GPUModelData& model,
-    cudaTextureObject_t skyTex,
-    const GPURenderArgs& args,
-    bool             excludeDirect)
+// ---- Miss: sky escape. Depth 0 sees the sky directly; deeper escapes are
+// ---- MIS-weighted against the NEE sky sampling of the previous vertex.
+__device__ __forceinline__ void gpu_shadeSkyEscape(
+    GPUPathState& st, PerPixelData& split, const GPURenderArgs& args,
+    cudaTextureObject_t skyTex, float3 throughput, float indS,
+    float sunConeHalfRad)
 {
-    const float sunConeHalfRad = args.sunConeHalfDeg * 0.01745329252f;
-    const int depth = st.depth;
-    // GI bounce energy scale (RENDER_INDIRECT_SCALE): every contribution
-    // contributed at depth > 0 scales uniformly — direct (depth-0) lighting
-    // untouched, the MIS pairings among depth>0 estimators stay balanced.
-    const float indS = (depth > 0) ? args.indirectScale : 1.0f;
-    Ray ray = st.ray;
-    float3 throughput = st.throughput;
-    float3 radiance = st.radiance;
-
-    if (!hit.hasHit()) {
-        // Sample HDR sky texture (equirectangular mapping)
-        float3 skyRad = make_float3(0.0f, 0.0f, 0.0f);
-        const float3 escDir = normalize(ray.direction);
-        if (skyTex) {
-            float u = atan2f(-escDir.x, escDir.z) * INV_TWO_PI + 0.5f;  // reference convention
-            float v = acosf(fmaxf(-1.0f, fminf(1.0f, escDir.y))) * INV_PI;
-            float4 tex = tex2D<float4>(skyTex, u, v);
-            skyRad = make_float3(tex.x, tex.y, tex.z);
-        } else {
-            // No sky texture: return black.
-            // The Cornell box is a closed scene (no sky visible), and the
-            // glass sphere test uses a checkerboard background. Without a
-            // sky texture, we should not fabricate a sky — doing so would
-            // leak an unnatural blue glow through the Cornell box opening.
-            skyRad = make_float3(0.0f, 0.0f, 0.0f);
+    // Sample HDR sky texture (equirectangular mapping)
+    float3 skyRad = make_float3(0.0f, 0.0f, 0.0f);
+    const float3 escDir = normalize(st.ray.direction);
+    if (skyTex) {
+        float u = atan2f(-escDir.x, escDir.z) * INV_TWO_PI + 0.5f;  // reference convention
+        float v = acosf(fmaxf(-1.0f, fminf(1.0f, escDir.y))) * INV_PI;
+        float4 tex = tex2D<float4>(skyTex, u, v);
+        skyRad = make_float3(tex.x, tex.y, tex.z);
+    } else {
+        // No sky texture: return black.
+        // The Cornell box is a closed scene (no sky visible), and the
+        // glass sphere test uses a checkerboard background. Without a
+        // sky texture, we should not fabricate a sky — doing so would
+        // leak an unnatural blue glow through the Cornell box opening.
+        skyRad = make_float3(0.0f, 0.0f, 0.0f);
+    }
+    if (st.depth == 0) {
+        split.emission += throughput * skyRad;
+    } else {
+        // Sky MIS (proper balance heuristic): the escape estimator
+        // carries its OWN weight at the ESCAPE direction,
+        // pb²/(pb²+pn²) — the old code reused 1-w_nee evaluated at
+        // the NEE sample's direction, a different direction, which
+        // left the escape estimator with positive-bias leftover
+        // energy whenever the NEE draw missed the bright region the
+        // escape ray happened to hit. Dielectric interfaces carry
+        // delta-sampling pdfs not comparable to an env-map density
+        // — keep them at full weight (their NEE sky side evaluates
+        // to ~0, so no double count can occur).
+        float skyW = 1.0f;
+        if (!st.prevBsdfDielectric && st.prevBsdfPdf > 0.0f &&
+            args.skyCDF && args.skyWidth > 0) {
+            float pn = gpu_skyEnvPdfAt(escDir, args.skyCDF, args.skyWidth, args.skyHeight);
+            float pb2 = st.prevBsdfPdf * st.prevBsdfPdf;
+            float pn2 = pn * pn;
+            skyW = pb2 / (pb2 + pn2 + 1e-16f);
         }
-        if (depth == 0) {
-            split.emission += throughput * skyRad;
-        } else {
-            // Sky MIS (proper balance heuristic): the escape estimator
-            // carries its OWN weight at the ESCAPE direction,
-            // pb²/(pb²+pn²) — the old code reused 1-w_nee evaluated at
-            // the NEE sample's direction, a different direction, which
-            // left the escape estimator with positive-bias leftover
-            // energy whenever the NEE draw missed the bright region the
-            // escape ray happened to hit. Dielectric interfaces carry
-            // delta-sampling pdfs not comparable to an env-map density
-            // — keep them at full weight (their NEE sky side evaluates
-            // to ~0, so no double count can occur).
-            float skyW = 1.0f;
-            if (!st.prevBsdfDielectric && st.prevBsdfPdf > 0.0f &&
-                args.skyCDF && args.skyWidth > 0) {
-                float pn = gpu_skyEnvPdfAt(escDir, args.skyCDF, args.skyWidth, args.skyHeight);
-                float pb2 = st.prevBsdfPdf * st.prevBsdfPdf;
-                float pn2 = pn * pn;
-                skyW = pb2 / (pb2 + pn2 + 1e-16f);
-            }
-            if (args.sunConeKill) skyW *= gpu_sunConeMask(escDir, args.sunDir, sunConeHalfRad);
-            float3 skyContrib = throughput * skyRad * skyW * indS;
-            gpu_decomposeLobe(st.prevBaseColor, skyContrib,
-                              split.radiance_Id, split.radiance_Is);
-            radiance += skyContrib;
-        }
-        if (depth == 0) radiance += throughput * skyRad;
-        st.radiance = radiance;
-        return false;
+        if (args.sunConeKill) skyW *= gpu_sunConeMask(escDir, args.sunDir, sunConeHalfRad);
+        float3 skyContrib = throughput * skyRad * skyW * indS;
+        gpu_decomposeLobe(st.prevBaseColor, skyContrib,
+                          split.radiance_Id, split.radiance_Is);
+        st.radiance += skyContrib;
     }
+    if (st.depth == 0) st.radiance += throughput * skyRad;
+}
 
-    // Build surface info using texture-aware hit info builder
-    HitInfo surface = gpu_getHitInfo(ray, hit, model, args.emissionScale);
-
-    // Roughness regularization: widen this and all subsequent lobes to the
-    // max roughness seen so far on the path (matches reference)
-    st.pathRough = fmaxf(st.pathRough, surface.roughness);
-    surface.roughness = fmaxf(surface.roughness, st.pathRough);
-
-    // NaN/Inf guard on surface data
-    if (isnan(surface.baseColor.x) || isnan(surface.emission.x) ||
-        isinf(surface.baseColor.x) || isinf(surface.emission.x)) {
-        return false;
-    }
-
-    // Alpha-cutout foliage (leaf/flower cards): texels with alpha < 0.5
-    // are holes — skip shading and pass the ray through. depth++ bounds
-    // the iteration (dense foliage consumes bounces, like transparency).
-    if (model.materials.alphaCutout && model.materials.alphaCutout[surface.materialID] &&
-        surface.opacity < 0.5f) {
-        st.ray = Ray(surface.position + ray.direction * (EPS_ZERO * 4.0f), ray.direction);
-        st.depth = depth + 1;
-        return true;
-    }
-
-    // ---- Beer's law absorption ----
-    // Apply absorption for the distance traveled in the CURRENT medium
-    // (the one the ray was just traveling in, BEFORE any push/pop).
-    // The medium stack is updated AFTER BSDF sampling (see below), so
-    // at this point it still reflects the medium the ray arrived in.
-    if (st.medStack.count() > 0 && depth > 0 && hit.t > 0) {
-        float3 absorb = gpu_applyAbsorption(st.medStack, hit.t);
-        throughput = throughput * absorb;
-    }
-
-    // First hit AOV
-    if (depth == 0) {
-        split.baseColor  = surface.baseColor;
-        split.normal     = surface.surfaceNormal;
-        split.position   = surface.position;
-        split.shapeNormal = surface.shapeNormal;
-        split.roughness  = surface.roughness;
-        split.metallic   = surface.metallic;
-        split.specular   = surface.specular;
-        split.opacity    = surface.opacity;
-    }
+// ---- Emissive surface: implicit light connection. Returns true when the
+// ---- path terminates on the emitter (radiance already accumulated).
+__device__ __forceinline__ bool gpu_shadeEmitterHit(
+    GPUPathState& st, const HitInfo& surface, const GPUModelData& model,
+    const Ray& ray, PerPixelData& split, float3 throughput, float indS,
+    float3& radiance)
+{
     // NaN/Inf guard on emission
     float3 emContrib = surface.emission;
     if (isnan(emContrib.x) || isnan(emContrib.y) || isnan(emContrib.z) ||
@@ -1229,357 +1415,344 @@ __device__ __noinline__ bool gpu_shadeBounce(
     // Terminate path on emissive surface (implicit light connection).
     // MIS: full weight unless the BSDF hit the SAME light triangle the
     // previous NEE sampled (that emitter is then already covered by NEE).
-    if (emLum > 1e-6f) {
-        float misW = 1.0f;
-        if (depth > 0 && st.misSampledCnt > 0) {
-            // Material-level match: NEE covered this EMITTER (any triangle)
-            float wsum = 0.0f; int matched = 0;
-            for (int j = 0; j < st.misSampledCnt; ++j)
-                if (surface.materialID == st.misSampledMat[j]) { wsum += st.misSampledW[j]; matched++; }
-            if (matched > 0) misW = fmaxf(0.0f, 1.0f - wsum / float(matched));
+    if (!(emLum > 1e-6f)) return false;
+
+    float misW = 1.0f;
+    if (st.depth > 0 && st.misSampledCnt > 0) {
+        // Material-level match: NEE covered this EMITTER (any triangle)
+        float wsum = 0.0f; int matched = 0;
+        for (int j = 0; j < st.misSampledCnt; ++j)
+            if (surface.materialID == st.misSampledMat[j]) { wsum += st.misSampledW[j]; matched++; }
+        if (matched > 0) misW = fmaxf(0.0f, 1.0f - wsum / float(matched));
+    }
+    float3 misEm = emContrib * misW * indS
+                 * gpu_emissionLobe(model.materials, surface.materialID, -ray.direction,
+                                    surface.shapeNormal);
+    if (st.depth > 0) {
+        // Firefly clamp on the FINAL contribution (depth > 0)
+        float3 finalEm = throughput * misEm;
+        float emLum2 = dot(finalEm, make_float3(0.299f, 0.587f, 0.114f));
+        // Indirect emitter hits: tight clamp (these are the firefly
+        // source). Direct lamp view at depth 0 keeps the 1000 clamp
+        // so HDR bloom halos still form.
+        if (emLum2 > 200.0f) finalEm = finalEm * (200.0f / emLum2);
+        gpu_decomposeLobe(st.prevBaseColor, finalEm,
+                          split.radiance_Id, split.radiance_Is);
+        radiance += finalEm;
+    } else {
+        split.emission += throughput * misEm;
+        radiance += throughput * misEm;
+    }
+    return true;
+}
+
+// ---- NEE: two-level, distance-weighted, multi-sample area-light sampling.
+// ---- Object selection weight is evaluated PER SHADING POINT:
+// ----   w_i = power_i / (dist²_i + area_i)  ∝ irradiance potential
+// ---- so tiny-but-near sources (hanging bulbs) get a fair sampling rate
+// ---- instead of their tiny global power share. K samples are averaged;
+// ---- variance of the direct estimate drops ~K×.
+__device__ __forceinline__ float3 gpu_shadeAreaLights(
+    GPUPathState& st, const HitInfo& surface, const GPUModelData& model,
+    const GPURenderArgs& args, const Ray& ray, float3 throughput,
+    PerPixelData& split, int depth, float indS)
+{
+    if (!(model.numLightObjects > 0 && model.lightObjPower &&
+          model.lightObjCentroid &&
+          model.numLightTriangles > 0 && model.lightTriangles))
+        return make_float3(0.0f, 0.0f, 0.0f);
+
+    // K=4 NEE samples: keep render time at the ~470s baseline; heavier denoising
+    // happens CPU-side (free) to make up for the extra variance
+    const int K = (surface.roughness < 0.3f) ? 1 : min(8, max(1, args.neeK));
+    float3 sumContrib = make_float3(0.0f, 0.0f, 0.0f);
+    for (int k = 0; k < K; ++k) {
+        float totalW = 0.0f;
+        for (int o = 0; o < model.numLightObjects; ++o) {
+            float3 dc = surface.position - model.lightObjCentroid[o];
+            totalW += model.lightObjPower[o] /
+                      (dot(dc, dc) + fmaxf(model.lightObjArea[o], 1e-4f));
         }
-        float3 misEm = emContrib * misW * indS
-                     * gpu_emissionLobe(model.materials, surface.materialID, -ray.direction,
-                                        surface.shapeNormal);
-        if (depth > 0) {
-            // Firefly clamp on the FINAL contribution (depth > 0)
-            float3 finalEm = throughput * misEm;
-            float emLum2 = dot(finalEm, make_float3(0.299f, 0.587f, 0.114f));
-            // Indirect emitter hits: tight clamp (these are the firefly
-            // source). Direct lamp view at depth 0 keeps the 1000 clamp
-            // so HDR bloom halos still form.
-            if (emLum2 > 200.0f) finalEm = finalEm * (200.0f / emLum2);
-            gpu_decomposeLobe(st.prevBaseColor, finalEm,
-                              split.radiance_Id, split.radiance_Is);
-            radiance += finalEm;
-        } else {
-            split.emission += throughput * misEm;
-            radiance += throughput * misEm;
+        if (!(totalW > 0.0f)) break;
+        float uo = curand_uniform(&st.rng) * totalW;
+        float acc = 0.0f;
+        int obj = model.numLightObjects - 1;
+        float pPick = 1e-6f;
+        for (int o = 0; o < model.numLightObjects; ++o) {
+            float3 dc = surface.position - model.lightObjCentroid[o];
+            float wi = model.lightObjPower[o] /
+                       (dot(dc, dc) + fmaxf(model.lightObjArea[o], 1e-4f));
+            acc += wi;
+            if (acc >= uo) { obj = o; pPick = wi / totalW; break; }
         }
-        st.radiance = radiance;
-        return false;
+        pPick = fmaxf(pPick, 1e-6f);
+        float objArea = fmaxf(model.lightObjArea[obj], 1e-8f);
+        // pdf of the sampled POINT on the object = P(obj) / Area(obj)
+        float ptPdf = pPick / objArea;
+
+        int first = model.lightObjFirst[obj];
+        int last  = model.lightObjFirst[obj + 1];
+        // In-object area prefix: P[k]-base = cumulative area up to k
+        float base = model.lightTriPrefix[first] - model.lightTriangles[first].area;
+        float a = curand_uniform(&st.rng) * objArea;
+        int tlo = first, thi = last - 1;
+        while (tlo < thi) {
+            int mid = (tlo + thi) / 2;
+            if (model.lightTriPrefix[mid] - base < a) tlo = mid + 1;
+            else thi = mid;
+        }
+        int li = tlo;
+        const GPULightTri& lt = model.lightTriangles[li];
+
+        float ru = curand_uniform(&st.rng), rv = curand_uniform(&st.rng);
+        if (ru + rv > 1.0f) { ru = 1.0f - ru; rv = 1.0f - rv; }
+        float rw = 1.0f - ru - rv;
+        float3 lightPos = rw * lt.v0 + ru * lt.v1 + rv * lt.v2;
+
+        float3 toLight = lightPos - surface.position;
+        float distSq = dot(toLight, toLight);
+        float dist = sqrtf(distSq);
+        float3 wi = toLight / dist;
+
+        if (dist <= 1e-6f) continue;
+        float NdotL = fmaxf(0.0f, dot(surface.surfaceNormal, wi));
+        if (NdotL <= 0.0f) continue;
+        bool occluded;
+        float3 shadowTint = gpu_transparentShadow(
+            surface.position + wi * EPS_ZERO, wi, dist - 1e-4f, model, occluded,
+            2.0f * tanf(args.camera.fov * 0.5f * 0.01745329252f)
+                / float(args.height), args.useMipmaps, args.anisoMax, args.lodScale);
+        if (occluded) continue;
+        // Light emits from both sides — use |cos(θ)| for the PDF
+        float3 e1l = lt.v1 - lt.v0, e2l = lt.v2 - lt.v0;
+        float3 ln = normalize(cross(e1l, e2l));
+        float cosLight = fabsf(dot(wi, ln));
+        float3 bsdfVal = gpu_evalBSDF(-ray.direction, wi, surface);
+        if (isnan(bsdfVal.x) || isinf(bsdfVal.x)) bsdfVal = make_float3(0,0,0);
+        float pdfSA = ptPdf * distSq / max(cosLight, 1e-8f);
+        if (!(pdfSA > 0.0f) || dot(bsdfVal, bsdfVal) <= 1e-16f) continue;
+        float bsdfPdf = gpu_pdfBSDF(-ray.direction, wi, surface);
+        float w_nee = 1.0f;
+        if (bsdfPdf > 1e-8f) {
+            float pn2 = pdfSA * pdfSA;
+            float pb2 = bsdfPdf * bsdfPdf;
+            w_nee = pn2 / (pn2 + pb2 + 1e-16f);
+        }
+        // This sample covers lt's EMITTER MATERIAL for the MIS rule
+        if (st.misSampledCnt < 8) {
+            st.misSampledMat[st.misSampledCnt] = lt.matId;
+            st.misSampledW[st.misSampledCnt] = w_nee;
+            st.misSampledCnt++;
+        }
+        // Photon travels from the emitter toward the shading point:
+        // that is -wi (wi points at the light). The lobe must weight
+        // the photon's travel direction. Light radiance carries the
+        // per-render emission scale (the load-time bake stays raw).
+        const float3 ltEm = lt.emission * args.emissionScale;
+        float3 contrib = ltEm * bsdfVal * NdotL / pdfSA * w_nee
+                       * gpu_emissionLobe(model.materials, lt.matId, -wi, ln)
+                       * shadowTint;
+        sumContrib += throughput * contrib / float(K);
+    }
+    // Clamp the SUMMED contribution once (per-sample clamping would
+    // under-count bright sources K times as often)
+    float lum = dot(sumContrib, make_float3(0.299f, 0.587f, 0.114f));
+    const float NEE_CLAMP = (surface.roughness < 0.3f) ? 5.0f : 15.0f;
+    if (lum > NEE_CLAMP) {
+        // Soft knee: keep 35% of the excess so lit-side peaks near
+        // geometry survive
+        float nl = NEE_CLAMP + (lum - NEE_CLAMP) * 0.35f;
+        sumContrib = sumContrib * (nl / lum);
+    }
+    sumContrib = sumContrib * indS;
+    if (depth == 0)
+        gpu_decomposeLobe(surface.baseColor, sumContrib,
+                          split.radiance_Dd, split.radiance_Ds);
+    else
+        gpu_decomposeLobe(surface.baseColor, sumContrib,
+                          split.radiance_Id, split.radiance_Is);
+    return sumContrib;
+}
+
+// ---- NEE: skybox as environment light (importance-sampled) ----
+__device__ __forceinline__ float3 gpu_shadeSkyNee(
+    GPUPathState& st, const HitInfo& surface, const GPUModelData& model,
+    const GPURenderArgs& args, cudaTextureObject_t skyTex, const Ray& ray,
+    float3 throughput, PerPixelData& split, int depth, float sunConeHalfRad)
+{
+    float3 skyDir;
+    float pdf = 0.0f;
+    bool sampled = false;
+
+    if (args.skyCDF && args.skyWidth > 0 && args.skyHeight > 0 && args.skyCDFSum > 0.0f) {
+        // ---- Importance sampling via CDF ----
+        float u = curand_uniform(&st.rng);
+        // CDF is an exclusive prefix over texels (cdf[0]=0,
+        // cdf[j] = P(texel < j)): texel t is drawn when
+        // u ∈ [cdf[t], cdf[t+1]). Search [1, n] for the first
+        // entry above u; the sampled texel is that index minus 1
+        // (searching [0, n) instead shifted the distribution by
+        // one texel and made the last texel unreachable).
+        int lo = 1, hi = args.skyWidth * args.skyHeight;
+        while (lo < hi) {
+            int mid = (lo + hi) / 2;
+            if (args.skyCDF[mid] <= u) lo = mid + 1;
+            else hi = mid;
+        }
+        int idx = lo;
+        int px = (idx - 1) % args.skyWidth;
+        int py = (idx - 1) / args.skyWidth;
+
+        // Convert pixel to direction (equirectangular)
+        float u_ = (px + 0.5f) / args.skyWidth;
+        float v_ = (py + 0.5f) / args.skyHeight;
+        skyDir = sphereToDir(make_float2(u_, v_));
+
+        // Compute PDF: solid angle conversion
+        int nPixels = args.skyWidth * args.skyHeight;
+        float cdfLo = (idx > 0) ? args.skyCDF[idx - 1] : 0.0f;
+        float cdfHi = args.skyCDF[idx];
+        float pixelPdf = (cdfHi - cdfLo);  // probability mass for this pixel
+
+        float theta = v_ * PI;
+        float sinTheta = sinf(theta);
+        if (sinTheta > 1e-6f) {
+            // Convert pixel PDF to solid angle PDF
+            // pdf = pixelPdf * nPixels / (2 * PI² * sin(theta))
+            pdf = pixelPdf * nPixels / (2.0f * PI * PI * sinTheta);
+            sampled = true;
+        }
+    } else {
+        // ---- Fallback: uniform cosine-weighted hemisphere ----
+        float u1 = curand_uniform(&st.rng);
+        float u2 = curand_uniform(&st.rng);
+        float r = sqrtf(u1);
+        float phi = 2.0f * PI * u2;
+        float3 skyLocal = make_float3(r*cosf(phi), r*sinf(phi), sqrtf(fmaxf(0.0f,1.0f-u1)));
+        float3 N = surface.surfaceNormal;
+        float3 ref = (fabsf(N.x) > 0.9f) ? make_float3(0,1,0) : make_float3(1,0,0);
+        float3 T = normalize(cross(N, ref));
+        float3 B = normalize(cross(N, T));
+        skyDir = normalize(skyLocal.x*T + skyLocal.y*B + skyLocal.z*N);
+        pdf = skyLocal.z * INV_PI;
+        sampled = true;
     }
 
-    // Ambient light removed — shadows emerge naturally from NEE shadow
-    // rays blocking direct light, and indirect bounces being dimmer in
-    // occluded regions. The old ambient term (baseColor * 0.05f) was
-    // added at every bounce without shadow testing, washing out all
-    // shadows and making furniture cast no visible shadows on the floor.
-
-    // ---- Russian roulette (matching CPU render.cpp logic) ----
-    // The CPU applies RR at EVERY bounce (not just deep bounces), scaling
-    // the surviving throughput by 1/(1-P_RR). This accumulated scaling
-    // at each bounce is what makes the CPU's indirect light brighter.
-    // The GPU previously only applied RR at depth >= 3, so early bounces
-    // (depth 0-2) were never scaled — making the GPU consistently dimmer.
-    //
-    // CPU's doNEE = P_RR < 0.9 && !isDielectric:
-    //   - Smooth surfaces (P_RR >= 0.9) skip RR to preserve reflections
-    //   - Dielectrics (glass) skip RR (no NEE needed)
-    if (!gpu_isDielectric(surface)) {
-        const float P_RR_Rough = 0.5f, P_RR_Smooth = 1.0f;
-        const float P_RR = P_RR_Smooth + (P_RR_Rough - P_RR_Smooth) * sqrtf(surface.roughness);
-        const float P_RR_THRESH = 0.9f;
-        if (P_RR < P_RR_THRESH) {
-            if (curand_uniform(&st.rng) > P_RR) { st.throughput = throughput; st.radiance = radiance; return false; }
-            // Divide by the SURVIVAL probability P_RR (not 1-P_RR). The path
-            // continues with probability P_RR, so surviving paths must be
-            // boosted by 1/P_RR to remain unbiased. Dividing by 1-P_RR (the
-            // termination probability) over-scaled indirect light by 1.8-5.3x
-            // per bounce, blowing out white walls/floor/ceiling.
-            throughput = throughput / fmaxf(P_RR, 1e-4f);
-        }
-    }
-    // Throughput clamp after RR scaling (matches CPU THROUGHPUT_CLAMP=500).
-    float tLum = dot(throughput, make_float3(0.299f, 0.587f, 0.114f));
-    if (tLum > 500.0f) throughput = throughput * (500.0f / tLum);
-
-    // Reset MIS records for this bounce. Entries are only added when an
-    // NEE sample actually SEES its emitter (occluded samples must leave
-    // their emitter fully covered by BSDF sampling instead).
-    st.misSampledCnt = 0;
-
-    // Direct light sampling (NEE): sample area lights + skybox
-    if (!excludeDirect) {
-        // ---- Two-level, distance-weighted, multi-sample NEE ----
-        // Object selection weight is evaluated PER SHADING POINT:
-        //   w_i = power_i / (dist²_i + area_i)  ∝ irradiance potential
-        // so tiny-but-near sources (hanging bulbs) get a fair sampling
-        // rate instead of their tiny global power share. K samples are
-        // averaged; variance of the direct estimate drops ~K×.
-        if (model.numLightObjects > 0 && model.lightObjPower &&
-            model.lightObjCentroid &&
-            model.numLightTriangles > 0 && model.lightTriangles) {
-            // K=4 NEE samples: keep render time at the ~470s baseline; heavier denoising
-            // happens CPU-side (free) to make up for the extra variance
-            const int K = (surface.roughness < 0.3f) ? 1 : min(8, max(1, args.neeK));
-            float3 sumContrib = make_float3(0.0f, 0.0f, 0.0f);
-            for (int k = 0; k < K; ++k) {
-                float totalW = 0.0f;
-                for (int o = 0; o < model.numLightObjects; ++o) {
-                    float3 dc = surface.position - model.lightObjCentroid[o];
-                    totalW += model.lightObjPower[o] /
-                              (dot(dc, dc) + fmaxf(model.lightObjArea[o], 1e-4f));
-                }
-                if (!(totalW > 0.0f)) break;
-                float uo = curand_uniform(&st.rng) * totalW;
-                float acc = 0.0f;
-                int obj = model.numLightObjects - 1;
-                float pPick = 1e-6f;
-                for (int o = 0; o < model.numLightObjects; ++o) {
-                    float3 dc = surface.position - model.lightObjCentroid[o];
-                    float wi = model.lightObjPower[o] /
-                               (dot(dc, dc) + fmaxf(model.lightObjArea[o], 1e-4f));
-                    acc += wi;
-                    if (acc >= uo) { obj = o; pPick = wi / totalW; break; }
-                }
-                pPick = fmaxf(pPick, 1e-6f);
-                float objArea = fmaxf(model.lightObjArea[obj], 1e-8f);
-                // pdf of the sampled POINT on the object = P(obj) / Area(obj)
-                float ptPdf = pPick / objArea;
-
-                int first = model.lightObjFirst[obj];
-                int last  = model.lightObjFirst[obj + 1];
-                // In-object area prefix: P[k]-base = cumulative area up to k
-                float base = model.lightTriPrefix[first] - model.lightTriangles[first].area;
-                float a = curand_uniform(&st.rng) * objArea;
-                int tlo = first, thi = last - 1;
-                while (tlo < thi) {
-                    int mid = (tlo + thi) / 2;
-                    if (model.lightTriPrefix[mid] - base < a) tlo = mid + 1;
-                    else thi = mid;
-                }
-                int li = tlo;
-                const GPULightTri& lt = model.lightTriangles[li];
-
-                float ru = curand_uniform(&st.rng), rv = curand_uniform(&st.rng);
-                if (ru + rv > 1.0f) { ru = 1.0f - ru; rv = 1.0f - rv; }
-                float rw = 1.0f - ru - rv;
-                float3 lightPos = rw * lt.v0 + ru * lt.v1 + rv * lt.v2;
-
-                float3 toLight = lightPos - surface.position;
-                float distSq = dot(toLight, toLight);
-                float dist = sqrtf(distSq);
-                float3 wi = toLight / dist;
-
-                if (dist <= 1e-6f) continue;
-                float NdotL = fmaxf(0.0f, dot(surface.surfaceNormal, wi));
-                if (NdotL <= 0.0f) continue;
-                bool occluded;
-                float3 shadowTint = gpu_transparentShadow(
-                    surface.position + wi * EPS_ZERO, wi, dist - 1e-4f, model, occluded);
-                if (occluded) continue;
-                // Light emits from both sides — use |cos(θ)| for the PDF
-                float3 e1l = lt.v1 - lt.v0, e2l = lt.v2 - lt.v0;
-                float3 ln = normalize(cross(e1l, e2l));
-                float cosLight = fabsf(dot(wi, ln));
-                float3 bsdfVal = gpu_evalBSDF(-ray.direction, wi, surface);
-                if (isnan(bsdfVal.x) || isinf(bsdfVal.x)) bsdfVal = make_float3(0,0,0);
-                float pdfSA = ptPdf * distSq / max(cosLight, 1e-8f);
-                if (!(pdfSA > 0.0f) || dot(bsdfVal, bsdfVal) <= 1e-16f) continue;
-                float bsdfPdf = gpu_pdfBSDF(-ray.direction, wi, surface);
-                float w_nee = 1.0f;
-                if (bsdfPdf > 1e-8f) {
-                    float pn2 = pdfSA * pdfSA;
-                    float pb2 = bsdfPdf * bsdfPdf;
-                    w_nee = pn2 / (pn2 + pb2 + 1e-16f);
-                }
-                // This sample covers lt's EMITTER MATERIAL for the MIS rule
-                if (st.misSampledCnt < 8) {
-                    st.misSampledMat[st.misSampledCnt] = lt.matId;
-                    st.misSampledW[st.misSampledCnt] = w_nee;
-                    st.misSampledCnt++;
-                }
-                // Photon travels from the emitter toward the shading point:
-                // that is -wi (wi points at the light). The lobe must weight
-                // the photon's travel direction. Light radiance carries the
-                // per-render emission scale (the load-time bake stays raw).
-                const float3 ltEm = lt.emission * args.emissionScale;
-                float3 contrib = ltEm * bsdfVal * NdotL / pdfSA * w_nee
-                               * gpu_emissionLobe(model.materials, lt.matId, -wi, ln)
-                               * shadowTint;
-                sumContrib += throughput * contrib / float(K);
-            }
-            // Clamp the SUMMED contribution once (per-sample clamping would
-            // under-count bright sources K times as often)
-            float lum = dot(sumContrib, make_float3(0.299f, 0.587f, 0.114f));
-            const float NEE_CLAMP = (surface.roughness < 0.3f) ? 5.0f : 15.0f;
-            if (lum > NEE_CLAMP) {
-                // Soft knee: keep 35% of the excess so lit-side peaks near
-                // geometry survive
-                float nl = NEE_CLAMP + (lum - NEE_CLAMP) * 0.35f;
-                sumContrib = sumContrib * (nl / lum);
-            }
-            sumContrib = sumContrib * indS;
-            radiance += sumContrib;
-            if (depth == 0)
-                gpu_decomposeLobe(surface.baseColor, sumContrib,
-                                  split.radiance_Dd, split.radiance_Ds);
-            else
-                gpu_decomposeLobe(surface.baseColor, sumContrib,
-                                  split.radiance_Id, split.radiance_Is);
-        }
-
-        // ---- Sample skybox as environment light (importance-sampled) ----
-        if (skyTex) {
-            float3 skyDir;
-            float pdf = 0.0f;
-            bool sampled = false;
-
-            if (args.skyCDF && args.skyWidth > 0 && args.skyHeight > 0 && args.skyCDFSum > 0.0f) {
-                // ---- Importance sampling via CDF ----
-                float u = curand_uniform(&st.rng);
-                // CDF is an exclusive prefix over texels (cdf[0]=0,
-                // cdf[j] = P(texel < j)): texel t is drawn when
-                // u ∈ [cdf[t], cdf[t+1]). Search [1, n] for the first
-                // entry above u; the sampled texel is that index minus 1
-                // (searching [0, n) instead shifted the distribution by
-                // one texel and made the last texel unreachable).
-                int lo = 1, hi = args.skyWidth * args.skyHeight;
-                while (lo < hi) {
-                    int mid = (lo + hi) / 2;
-                    if (args.skyCDF[mid] <= u) lo = mid + 1;
-                    else hi = mid;
-                }
-                int idx = lo;
-                int px = (idx - 1) % args.skyWidth;
-                int py = (idx - 1) / args.skyWidth;
-
-                // Convert pixel to direction (equirectangular)
-                float u_ = (px + 0.5f) / args.skyWidth;
-                float v_ = (py + 0.5f) / args.skyHeight;
-                skyDir = sphereToDir(make_float2(u_, v_));
-
-                // Compute PDF: solid angle conversion
-                int nPixels = args.skyWidth * args.skyHeight;
-                float cdfLo = (idx > 0) ? args.skyCDF[idx - 1] : 0.0f;
-                float cdfHi = args.skyCDF[idx];
-                float pixelPdf = (cdfHi - cdfLo);  // probability mass for this pixel
-
-                float theta = v_ * PI;
-                float sinTheta = sinf(theta);
-                if (sinTheta > 1e-6f) {
-                    // Convert pixel PDF to solid angle PDF
-                    // pdf = pixelPdf * nPixels / (2 * PI² * sin(theta))
-                    pdf = pixelPdf * nPixels / (2.0f * PI * PI * sinTheta);
-                    sampled = true;
-                }
-            } else {
-                // ---- Fallback: uniform cosine-weighted hemisphere ----
-                float u1 = curand_uniform(&st.rng);
-                float u2 = curand_uniform(&st.rng);
-                float r = sqrtf(u1);
-                float phi = 2.0f * PI * u2;
-                float3 skyLocal = make_float3(r*cosf(phi), r*sinf(phi), sqrtf(fmaxf(0.0f,1.0f-u1)));
-                float3 N = surface.surfaceNormal;
-                float3 ref = (fabsf(N.x) > 0.9f) ? make_float3(0,1,0) : make_float3(1,0,0);
-                float3 T = normalize(cross(N, ref));
-                float3 B = normalize(cross(N, T));
-                skyDir = normalize(skyLocal.x*T + skyLocal.y*B + skyLocal.z*N);
-                pdf = skyLocal.z * INV_PI;
-                sampled = true;
-            }
-
-            if (sampled && pdf > 1e-8f) {
-                float NdotL = fmaxf(0.0f, dot(surface.surfaceNormal, skyDir));
-                if (NdotL > 0.0f) {
-                    bool skyBlocked;
-                    float3 skyTint = gpu_transparentShadow(
-                        surface.position + skyDir * EPS_ZERO, skyDir,
-                        1e30f, model, skyBlocked);
-                    if (!skyBlocked) {
-                        float theta = acosf(fmaxf(-1.0f, fminf(1.0f, skyDir.y)));
-                        float az = atan2f(-skyDir.x, skyDir.z);  // reference convention
-                        float u_ = az * INV_TWO_PI + 0.5f;
-                        float v_ = theta * INV_PI;
-                        float4 tex = tex2D<float4>(skyTex, u_, v_);
-                        float3 skyRad = make_float3(tex.x, tex.y, tex.z);
-                        float3 bsdfVal = gpu_evalBSDF(-ray.direction, skyDir, surface);
-                        if (dot(bsdfVal, bsdfVal) > 1e-16f) {
-                            // Balance weight for THIS NEE sample at its
-                            // own direction; the escape estimator at the
-                            // next vertex carries the complementary
-                            // weight (see the sky-escape block).
-                            float bsdfPdfSky = gpu_pdfBSDF(-ray.direction, skyDir, surface);
-                            float w_nee = 1.0f;
-                            if (bsdfPdfSky > 1e-8f) {
-                                float pn2 = pdf * pdf;
-                                float pb2 = bsdfPdfSky * bsdfPdfSky;
-                                w_nee = pn2 / (pn2 + pb2 + 1e-16f);
-                            }
-                            float3 contrib = skyRad * bsdfVal * NdotL / pdf
-                                           * w_nee * skyTint;
-                            // Sun-cone de-duplication: with a delta sun in
-                            // the scene, the HDRI cone is a visual glow
-                            // only, not a second light source.
-                            if (args.sunConeKill)
-                                contrib = contrib * gpu_sunConeMask(skyDir, args.sunDir, sunConeHalfRad);
-                            // Clamp FINAL contribution (throughput * contrib)
-                            float3 finalSky = throughput * contrib;
-                            float lum = dot(finalSky, make_float3(0.299f,0.587f,0.114f));
-                            if (lum > 50.0f) finalSky = finalSky * (50.0f/lum);
-                            radiance += finalSky;
-                            if (depth == 0)
-                                gpu_decomposeLobe(surface.baseColor, finalSky,
-                                                  split.radiance_Dd, split.radiance_Ds);
-                            else
-                                gpu_decomposeLobe(surface.baseColor, finalSky,
-                                                  split.radiance_Id, split.radiance_Is);
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    // ---- Directional sun (delta light, NEE-only) ----
-    // A delta light cannot be sampled by the BSDF, so the estimate is
-    // deterministic (no MIS, no PDF): radiance * bsdf * NdotL * T.
-    if (args.hasSun && !excludeDirect) {
-        // Cone jitter around sunDir (RENDER_SUN_SOFT, half-angle degrees,
-        // default 1.0): physically the sun's disc, artistically a
-        // soft-shadow knob. Radiance constant over the cone = unbiased.
-        float softDeg = args.sunSoftDeg;
-        float3 sw = args.sunDir;
-        float3 su = normalize(cross(fabsf(sw.y) < 0.99f ? make_float3(0,1,0) : make_float3(1,0,0), sw));
-        float3 sv = cross(sw, su);
-        float3 wi = sw;
-        if (softDeg > 0.0f) {
-            float u1 = curand_uniform(&st.rng), u2 = curand_uniform(&st.rng);
-            float thetaMax = softDeg * (float(M_PI) / 180.0f);
-            float cosT = 1.0f - u1 * (1.0f - cosf(thetaMax));
-            float sinT = sqrtf(fmaxf(0.0f, 1.0f - cosT * cosT));
-            float phi = 2.0f * float(M_PI) * u2;
-            wi = normalize(cosT * sw + sinT * (cosf(phi) * su + sinf(phi) * sv));
-        }
-        float NdotL = dot(surface.surfaceNormal, wi);
+    if (sampled && pdf > 1e-8f) {
+        float NdotL = fmaxf(0.0f, dot(surface.surfaceNormal, skyDir));
         if (NdotL > 0.0f) {
-            bool blocked;
-            float3 tint = gpu_transparentShadow(
-                surface.position + wi * EPS_ZERO, wi, 1e30f, model, blocked);
-            if (!blocked) {
-                float3 bsdfVal = gpu_evalBSDF(-ray.direction, wi, surface);
+            bool skyBlocked;
+            float3 skyTint = gpu_transparentShadow(
+                surface.position + skyDir * EPS_ZERO, skyDir,
+                1e30f, model, skyBlocked,
+                2.0f * tanf(args.camera.fov * 0.5f * 0.01745329252f)
+                    / float(args.height), args.useMipmaps, args.anisoMax, args.lodScale);
+            if (!skyBlocked) {
+                float theta = acosf(fmaxf(-1.0f, fminf(1.0f, skyDir.y)));
+                float az = atan2f(-skyDir.x, skyDir.z);  // reference convention
+                float u_ = az * INV_TWO_PI + 0.5f;
+                float v_ = theta * INV_PI;
+                float4 tex = tex2D<float4>(skyTex, u_, v_);
+                float3 skyRad = make_float3(tex.x, tex.y, tex.z);
+                float3 bsdfVal = gpu_evalBSDF(-ray.direction, skyDir, surface);
                 if (dot(bsdfVal, bsdfVal) > 1e-16f) {
-                    float3 contrib = args.sunRadiance * bsdfVal * NdotL * tint * indS;
-                    if (depth == 0) {
-                        gpu_decomposeLobe(surface.baseColor, contrib,
-                                          split.radiance_Dd, split.radiance_Ds);
-                        // P1 sun matte: first-hit direct-sun luminance. The
-                        // cone-jittered occlusion averages over samples, so
-                        // soft shadows show up as a smooth 0..1 mask.
-                        split.sunMask += dot(throughput * contrib,
-                                             make_float3(0.299f, 0.587f, 0.114f));
-                    } else {
-                        gpu_decomposeLobe(st.prevBaseColor, contrib,
-                                          split.radiance_Id, split.radiance_Is);
+                    // Balance weight for THIS NEE sample at its
+                    // own direction; the escape estimator at the
+                    // next vertex carries the complementary
+                    // weight (see the sky-escape block).
+                    float bsdfPdfSky = gpu_pdfBSDF(-ray.direction, skyDir, surface);
+                    float w_nee = 1.0f;
+                    if (bsdfPdfSky > 1e-8f) {
+                        float pn2 = pdf * pdf;
+                        float pb2 = bsdfPdfSky * bsdfPdfSky;
+                        w_nee = pn2 / (pn2 + pb2 + 1e-16f);
                     }
-                    radiance += throughput * contrib;
+                    float3 contrib = skyRad * bsdfVal * NdotL / pdf
+                                   * w_nee * skyTint;
+                    // Sun-cone de-duplication: with a delta sun in
+                    // the scene, the HDRI cone is a visual glow
+                    // only, not a second light source.
+                    if (args.sunConeKill)
+                        contrib = contrib * gpu_sunConeMask(skyDir, args.sunDir, sunConeHalfRad);
+                    // Clamp FINAL contribution (throughput * contrib)
+                    float3 finalSky = throughput * contrib;
+                    float lum = dot(finalSky, make_float3(0.299f,0.587f,0.114f));
+                    if (lum > 50.0f) finalSky = finalSky * (50.0f/lum);
+                    if (depth == 0)
+                        gpu_decomposeLobe(surface.baseColor, finalSky,
+                                          split.radiance_Dd, split.radiance_Ds);
+                    else
+                        gpu_decomposeLobe(surface.baseColor, finalSky,
+                                          split.radiance_Id, split.radiance_Is);
+                    return finalSky;
                 }
             }
         }
     }
+    return make_float3(0.0f, 0.0f, 0.0f);
+}
 
-    // BSDF sampling for next bounce (with medium IOR for nested glass)
+// ---- NEE: directional sun (delta light, NEE-only) ----
+// A delta light cannot be sampled by the BSDF, so the estimate is
+// deterministic (no MIS, no PDF): radiance * bsdf * NdotL * T.
+__device__ __forceinline__ float3 gpu_shadeSunNee(
+    GPUPathState& st, const HitInfo& surface, const GPUModelData& model,
+    const GPURenderArgs& args, const Ray& ray, float3 throughput,
+    PerPixelData& split, int depth, float indS)
+{
+    // Cone jitter around sunDir (RENDER_SUN_SOFT, half-angle degrees,
+    // default 1.0): physically the sun's disc, artistically a
+    // soft-shadow knob. Radiance constant over the cone = unbiased.
+    float softDeg = args.sunSoftDeg;
+    float3 sw = args.sunDir;
+    float3 su = normalize(cross(fabsf(sw.y) < 0.99f ? make_float3(0,1,0) : make_float3(1,0,0), sw));
+    float3 sv = cross(sw, su);
+    float3 wi = sw;
+    if (softDeg > 0.0f) {
+        float u1 = curand_uniform(&st.rng), u2 = curand_uniform(&st.rng);
+        float thetaMax = softDeg * (float(M_PI) / 180.0f);
+        float cosT = 1.0f - u1 * (1.0f - cosf(thetaMax));
+        float sinT = sqrtf(fmaxf(0.0f, 1.0f - cosT * cosT));
+        float phi = 2.0f * float(M_PI) * u2;
+        wi = normalize(cosT * sw + sinT * (cosf(phi) * su + sinf(phi) * sv));
+    }
+    float NdotL = dot(surface.surfaceNormal, wi);
+    if (NdotL > 0.0f) {
+        bool blocked;
+        float3 tint = gpu_transparentShadow(
+            surface.position + wi * EPS_ZERO, wi, 1e30f, model, blocked,
+            2.0f * tanf(args.camera.fov * 0.5f * 0.01745329252f)
+                / float(args.height), args.useMipmaps, args.anisoMax, args.lodScale);
+        if (!blocked) {
+            float3 bsdfVal = gpu_evalBSDF(-ray.direction, wi, surface);
+            if (dot(bsdfVal, bsdfVal) > 1e-16f) {
+                float3 contrib = args.sunRadiance * bsdfVal * NdotL * tint * indS;
+                if (depth == 0) {
+                    gpu_decomposeLobe(surface.baseColor, contrib,
+                                      split.radiance_Dd, split.radiance_Ds);
+                    // P1 sun matte: first-hit direct-sun luminance. The
+                    // cone-jittered occlusion averages over samples, so
+                    // soft shadows show up as a smooth 0..1 mask.
+                    split.sunMask += dot(throughput * contrib,
+                                         make_float3(0.299f, 0.587f, 0.114f));
+                } else {
+                    gpu_decomposeLobe(st.prevBaseColor, contrib,
+                                      split.radiance_Id, split.radiance_Is);
+                }
+                return throughput * contrib;
+            }
+        }
+    }
+    return make_float3(0.0f, 0.0f, 0.0f);
+}
+
+// ---- BSDF sampling for the next bounce (with medium IOR for nested glass).
+// ---- Returns true when the path continues; st + throughput/radiance are
+// ---- committed exactly as the original monolithic body did.
+__device__ __forceinline__ bool gpu_sampleNextBounce(
+    GPUPathState& st, const HitInfo& surface, const Ray& ray, int depth,
+    float3& throughput, float3& radiance)
+{
     float3 outDir;
     float bsdfPdf;
     float medEta = st.medStack.topEta();
@@ -1693,6 +1866,150 @@ __device__ __noinline__ bool gpu_shadeBounce(
     }
     st.throughput = throughput; st.radiance = radiance;
     return false;  // path ends (absorption or invalid bounce)
+}
+
+__device__ __noinline__ bool gpu_shadeBounce(
+    GPUPathState&    st,
+    PerPixelData&    split,
+    const HitRecord& hit,
+    const GPUModelData& model,
+    cudaTextureObject_t skyTex,
+    const GPURenderArgs& args,
+    bool             excludeDirect)
+{
+    const float sunConeHalfRad = args.sunConeHalfDeg * 0.01745329252f;
+    const int depth = st.depth;
+    // GI bounce energy scale (RENDER_INDIRECT_SCALE): every contribution
+    // contributed at depth > 0 scales uniformly — direct (depth-0) lighting
+    // untouched, the MIS pairings among depth>0 estimators stay balanced.
+    const float indS = (depth > 0) ? args.indirectScale : 1.0f;
+    Ray ray = st.ray;
+    float3 throughput = st.throughput;
+    float3 radiance = st.radiance;
+
+    if (!hit.hasHit()) {
+        gpu_shadeSkyEscape(st, split, args, skyTex, throughput, indS,
+                           sunConeHalfRad);
+        return false;
+    }
+
+    // Build surface info using texture-aware hit info builder
+    HitInfo surface = gpu_getHitInfo(ray, hit, model, args.emissionScale,
+                                     2.0f * tanf(args.camera.fov * 0.5f * 0.01745329252f)
+                                         / float(args.height),
+                                     args.useMipmaps, args.anisoMax, args.lodScale,
+                                     st.depth == 0);
+
+    // Roughness regularization: widen this and all subsequent lobes to the
+    // max roughness seen so far on the path (matches reference)
+    st.pathRough = fmaxf(st.pathRough, surface.roughness);
+    surface.roughness = fmaxf(surface.roughness, st.pathRough);
+
+    // NaN/Inf guard on surface data
+    if (isnan(surface.baseColor.x) || isnan(surface.emission.x) ||
+        isinf(surface.baseColor.x) || isinf(surface.emission.x)) {
+        return false;
+    }
+
+    // Alpha-cutout foliage (leaf/flower cards): texels with alpha < 0.5
+    // are holes — skip shading and pass the ray through. depth++ bounds
+    // the iteration (dense foliage consumes bounces, like transparency).
+    if (model.materials.alphaCutout && model.materials.alphaCutout[surface.materialID] &&
+        surface.opacity < 0.5f) {
+        st.ray = Ray(surface.position + ray.direction * (EPS_ZERO * 4.0f), ray.direction);
+        st.depth = depth + 1;
+        return true;
+    }
+
+    // ---- Beer's law absorption ----
+    // Apply absorption for the distance traveled in the CURRENT medium
+    // (the one the ray was just traveling in, BEFORE any push/pop).
+    // The medium stack is updated AFTER BSDF sampling (see below), so
+    // at this point it still reflects the medium the ray arrived in.
+    if (st.medStack.count() > 0 && depth > 0 && hit.t > 0) {
+        float3 absorb = gpu_applyAbsorption(st.medStack, hit.t);
+        throughput = throughput * absorb;
+    }
+
+    // First hit AOV
+    if (depth == 0) {
+        // Guide albedo: full-detail (level-0) value when available — see
+        // HitInfo::baseColorFine. Shading still uses surface.baseColor.
+        split.baseColor  = surface.baseColorFine;
+        split.normal     = surface.surfaceNormal;
+        split.position   = surface.position;
+        split.shapeNormal = surface.shapeNormal;
+        split.roughness  = surface.roughness;
+        split.metallic   = surface.metallic;
+        split.specular   = surface.specular;
+        split.opacity    = surface.opacity;
+    }
+
+    if (gpu_shadeEmitterHit(st, surface, model, ray, split, throughput, indS,
+                            radiance)) {
+        st.radiance = radiance;
+        return false;
+    }
+
+    // Ambient light removed — shadows emerge naturally from NEE shadow
+    // rays blocking direct light, and indirect bounces being dimmer in
+    // occluded regions. The old ambient term (baseColor * 0.05f) was
+    // added at every bounce without shadow testing, washing out all
+    // shadows and making furniture cast no visible shadows on the floor.
+
+    // ---- Russian roulette (matching CPU render.cpp logic) ----
+    // The CPU applies RR at EVERY bounce (not just deep bounces), scaling
+    // the surviving throughput by 1/(1-P_RR). This accumulated scaling
+    // at each bounce is what makes the CPU's indirect light brighter.
+    // The GPU previously only applied RR at depth >= 3, so early bounces
+    // (depth 0-2) were never scaled — making the GPU consistently dimmer.
+    //
+    // CPU's doNEE = P_RR < 0.9 && !isDielectric:
+    //   - Smooth surfaces (P_RR >= 0.9) skip RR to preserve reflections
+    //   - Dielectrics (glass) skip RR (no NEE needed)
+    if (!gpu_isDielectric(surface)) {
+        const float P_RR_Rough = 0.5f, P_RR_Smooth = 1.0f;
+        const float P_RR = P_RR_Smooth + (P_RR_Rough - P_RR_Smooth) * sqrtf(surface.roughness);
+        const float P_RR_THRESH = 0.9f;
+        if (P_RR < P_RR_THRESH) {
+            if (curand_uniform(&st.rng) > P_RR) { st.throughput = throughput; st.radiance = radiance; return false; }
+            // Divide by the SURVIVAL probability P_RR (not 1-P_RR). The path
+            // continues with probability P_RR, so surviving paths must be
+            // boosted by 1/P_RR to remain unbiased. Dividing by 1-P_RR (the
+            // termination probability) over-scaled indirect light by 1.8-5.3x
+            // per bounce, blowing out white walls/floor/ceiling.
+            throughput = throughput / fmaxf(P_RR, 1e-4f);
+        }
+    }
+    // Throughput clamp after RR scaling (matches CPU THROUGHPUT_CLAMP=500).
+    float tLum = dot(throughput, make_float3(0.299f, 0.587f, 0.114f));
+    if (tLum > 500.0f) throughput = throughput * (500.0f / tLum);
+
+    // Reset MIS records for this bounce. Entries are only added when an
+    // NEE sample actually SEES its emitter (occluded samples must leave
+    // their emitter fully covered by BSDF sampling instead).
+    st.misSampledCnt = 0;
+
+    // Direct light sampling (NEE): sample area lights + skybox
+    if (!excludeDirect) {
+        radiance += gpu_shadeAreaLights(st, surface, model, args, ray,
+                                        throughput, split, depth, indS);
+        if (skyTex)
+            radiance += gpu_shadeSkyNee(st, surface, model, args, skyTex, ray,
+                                        throughput, split, depth, sunConeHalfRad);
+    }
+
+    // ---- Directional sun (delta light, NEE-only) ----
+    if (args.hasSun && !excludeDirect) {
+        radiance += gpu_shadeSunNee(st, surface, model, args, ray, throughput,
+                                    split, depth, indS);
+    }
+
+    if (gpu_sampleNextBounce(st, surface, ray, depth, throughput, radiance))
+        return true;
+    st.throughput = throughput;
+    st.radiance = radiance;
+    return false;
 }
 
 __device__ float3 tracePath(
@@ -2129,9 +2446,7 @@ void renderGPU(GPURenderArgs args, GPUModelData model,
     cu(cudaFree(gpuSunMask));
 }
 
-// Wavefront pipeline (光线重排序 + 按材质分批 + 自适应逐像素) — included
-// into this translation unit (same pattern as bvh_gpu.cu above): separable
-// compilation is disabled, and the shade kernel calls device functions
-// (gpu_shadeBounce/traceRay) defined here.
-#include "render_wavefront.cu"
+// Wavefront pipeline (光线重排序 + 按材质分批 + 自适应逐像素) lives in
+// render_wavefront.cu; src/cuda_tu.cu includes it after this file so the
+// shade kernel can call the device functions defined above.
 

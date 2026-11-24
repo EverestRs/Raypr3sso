@@ -3,6 +3,7 @@
 #include "../include/types.h"
 #include "camera.h"
 #include "render.h"       // PerPixelData
+#include "render_config.h"
 #include "model.h"        // GPUModelData
 #include <atomic>
 
@@ -69,6 +70,22 @@ struct GPURenderArgs {
     // (fixtures on) views without a reload. 1.0 = unbiased default; applied
     // in gpu_shadeBounce at the two emission consumption points.
     float emissionScale = 1.0f;
+
+    // P0 texture clarity: mipmap + trilinear sampling of the RGBA8 mip
+    // chain (RENDER_MIPMAP=1; default 0 = bilinear on level 0 only,
+    // byte-identical historical path). The LOD is computed analytically
+    // from the triangle UV Jacobian + hit distance + camera fov/height.
+    int useMipmaps = 0;
+
+    // Anisotropy cap for the mip filter (RENDER_ANISO, default 2): the
+    // coarse-axis footprint / anisoMax is covered by filter taps along the
+    // coarse axis; the fine axis keeps mip resolution.
+    float anisoMax = 2.0f;
+
+    // P0 diagnostics: LOD bias for the analytic mip level (RENDER_LOD_SCALE,
+    // default 1). <1 keeps the LOD shallower — for measuring how much of
+    // the sharpness loss is real filtering vs the footprint estimate.
+    float lodScale = 1.0f;
 
     // NEE samples per rough-surface hit (设计 17 的 NEE K). 0 = resolve to
     // the process default (RENDER_NEE_K via setNeeK, else 4) at render
@@ -293,6 +310,12 @@ void applyPhysicalEnvFromEnv(GPURenderArgs& args);
 // az/el，radiance = inten × RENDER_SUN_TINT，soft/cone-kill 仍跟随 env——
 // 与 env rig 同观感。inten<=0 时直接返回 false（关太阳）。
 bool applySunParams(GPURenderArgs& args, float az, float el, float inten);
+// Apply a RenderConfig's sun + physical knobs to args. The env fallbacks are
+// for the server's no-profile path (startup-rig parity); the CLI passes its
+// env-built config with both false.
+void applyRenderConfig(GPURenderArgs& args, const RenderConfig& config,
+                       bool sunEnvFallback = false,
+                       bool physicalEnvFallback = false);
 // Foliage shadow transmission knob (RENDER_LEAF_SHADOW_TINT, default 1.0)
 void setLeafShadowTint(float t);
 // Exact sRGB EOTF for baseColor textures (RENDER_SRGB_EXACT=1; default pow2.2)

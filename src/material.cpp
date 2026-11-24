@@ -628,6 +628,54 @@ void ImageTexture::generateMipmaps() {
     }
 }
 
+void ImageTexture::rebuildMipmapsSrgb(float gamma) {
+    // Same geometry as generateMipmaps, but RGB averaging happens in the
+    // pow(2.2) domain the shader decodes with (gpu_toLinear), and alpha
+    // stays linear. Re-encode with pow(1/2.2) back into the stored bytes so
+    // the sampling path is unchanged.
+    mipmaps.clear();
+    std::vector<uint8_t> prevData = data;
+    int pw = width, ph = height;
+    while (pw > 1 || ph > 1) {
+        int nw = std::max(1, pw / 2);
+        int nh = std::max(1, ph / 2);
+        ImageTexture mip;
+        mip.width = nw;
+        mip.height = nh;
+        mip.channels = channels;
+        mip.data.resize(size_t(nw) * nh * channels);
+
+        for (int y = 0; y < nh; ++y) {
+            for (int x = 0; x < nw; ++x) {
+                for (int c = 0; c < channels; ++c) {
+                    double sum = 0.0;
+                    int cnt = 0;
+                    for (int dy = 0; dy < 2; ++dy) {
+                        for (int dx = 0; dx < 2; ++dx) {
+                            int sx = x * 2 + dx;
+                            int sy = y * 2 + dy;
+                            if (sx < pw && sy < ph) {
+                                const double v =
+                                    prevData[(size_t(sy) * pw + sx) * channels + c] / 255.0;
+                                sum += (c == 3) ? v : std::pow(v, double(gamma));  // alpha linear
+                                ++cnt;
+                            }
+                        }
+                    }
+                    const double mean = cnt > 0 ? sum / cnt : 0.0;
+                    const double out = (c == 3) ? mean : std::pow(mean, 1.0 / double(gamma));
+                    mip.data[(size_t(y) * nw + x) * channels + c] =
+                        static_cast<uint8_t>(std::min(255.0, std::max(0.0, out * 255.0 + 0.5)));
+                }
+            }
+        }
+        mipmaps.push_back(std::move(mip));
+        prevData = mipmaps.back().data;
+        pw = nw;
+        ph = nh;
+    }
+}
+
 // ---- Material ----
 // isEmissive() is now inline in material.h
 

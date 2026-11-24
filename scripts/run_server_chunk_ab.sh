@@ -7,6 +7,7 @@
 # old generation's chain without crashing the worker.
 set -euo pipefail
 TOKEN="${TOKEN:-devtoken}"
+BIN="${BIN:-./build/render_server}"
 cd "$(dirname "$0")/.."
 
 DUMP=$(mktemp -d)
@@ -14,7 +15,7 @@ PORT=${PORT:-9101}
 SPP=${SPP:-64}
 CHUNK=${CHUNK:-8}
 
-RENDER_SERVER_DUMP_DIR="$DUMP" RENDER_TOKEN="$TOKEN" ./build/render_server 127.0.0.1 "$PORT" > "$DUMP/server.log" 2>&1 &
+RENDER_SERVER_DUMP_DIR="$DUMP" RENDER_TOKEN="$TOKEN" "$BIN" 127.0.0.1 "$PORT" > "$DUMP/server.log" 2>&1 &
 SRV=$!
 # Keep the dump directory when the A/B fails so the mismatch can be
 # quantified; clean up only on success/interrupt-free exit.

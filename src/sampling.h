@@ -8,6 +8,11 @@ struct HitInfo {
     float3 shapeNormal;
     float3 surfaceNormal;
     float3 baseColor;
+    // P0 denoiser guide: full-detail (level-0) albedo at the first hit.
+    // The shading albedo is mip-filtered at distance; the multi-scale
+    // detail transfer can only restore texture that exists in the guide,
+    // so the G-buffer takes this unmipped value instead.
+    float3 baseColorFine;
     float3 emission;
     float  specular;
     float  roughness;

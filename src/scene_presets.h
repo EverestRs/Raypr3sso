@@ -14,6 +14,7 @@
 // scripts/ and README prose — running the engine without them silently
 // produced an uncalibrated image).
 #include "camera.h"
+#include "render_config.h"
 
 #include <cstdlib>
 #include <cstring>
@@ -56,38 +57,15 @@ struct ScenePreset {
 // Keys absent from the list keep their neutral defaults.
 struct RigProfile {
     bool valid = false;
-    bool hasSun = false;
-    float sunAz = 0.0f, sunEl = 45.0f, sunInt = 0.0f;
-    float emissionScale = 1.0f, indirectScale = 1.0f;
-    float wbStrength = 0.0f, saturationBoost = 1.0f;
-    bool splitKeySun = false;
-    float splitWarm = 0.0f, splitCool = 0.0f;
-    std::string gradeBands;          // raw "l,r,g,b ..." string (parsed at encode)
+    RenderConfig config;
 };
 
 inline RigProfile parseRigProfile(const char* const* rigEnv) {
     RigProfile p;
     if (!rigEnv) return p;
     p.valid = true;
-    for (const char* const* kv = rigEnv; *kv; ++kv) {
-        const std::string s(*kv);
-        const size_t eq = s.find('=');
-        if (eq == std::string::npos || eq == 0) continue;
-        const std::string key = s.substr(0, eq);
-        const std::string val = s.substr(eq + 1);
-        const char* v = val.c_str();
-        if      (key == "RENDER_SUN_INT")        { p.sunInt = std::strtof(v, nullptr); p.hasSun = p.sunInt > 0.0f; }
-        else if (key == "RENDER_SUN_AZ")         p.sunAz = std::strtof(v, nullptr);
-        else if (key == "RENDER_SUN_EL")         p.sunEl = std::strtof(v, nullptr);
-        else if (key == "RENDER_EMISSION_SCALE") p.emissionScale = std::strtof(v, nullptr);
-        else if (key == "RENDER_INDIRECT_SCALE") p.indirectScale = std::strtof(v, nullptr);
-        else if (key == "RENDER_WB_STRENGTH")    p.wbStrength = std::strtof(v, nullptr);
-        else if (key == "RENDER_SATURATION")     p.saturationBoost = std::strtof(v, nullptr);
-        else if (key == "RENDER_SPLIT_KEY")      p.splitKeySun = (val == "sun");
-        else if (key == "RENDER_SPLIT_WARM")     p.splitWarm = std::strtof(v, nullptr);
-        else if (key == "RENDER_SPLIT_COOL")     p.splitCool = std::strtof(v, nullptr);
-        else if (key == "RENDER_GRADE_BANDS")    p.gradeBands = val;
-    }
+    for (const char* const* kv = rigEnv; *kv; ++kv)
+        applyRigEntry(p.config, *kv);
     return p;
 }
 
@@ -140,9 +118,25 @@ inline const char* const kCombinedRig[] = {
     "RENDER_SPLIT_COOL=0.07",
     "RENDER_CURVE=0,0 0.1,0.06 0.2,0.13 0.3,0.20 0.4,0.27 0.55,0.50 0.66,0.74 0.85,0.88 1,0.96",
     "RENDER_AO=1",
+    // P0 texture clarity: analytic-LOD trilinear mips + 4-tap anisotropic
+    // filtering along the coarse axis (street floor HF 0.26 -> 0.33 of the
+    // official plate; facade/awning unchanged). Off = byte-identical legacy.
+    "RENDER_MIPMAP=1",
+    "RENDER_ANISO=4",
+    // Conservative LOD bias: the 540p viewer tier amplifies prefiltering
+    // (floor/Vespa soften); 0.75 keeps ~the level-0 detail at that tier
+    // while still removing the grazing-angle aliasing at 1080p+.
+    "RENDER_LOD_SCALE=0.75",
     "RENDER_DENOISE=1",
     "RENDER_OIDN=1",
-    "RENDER_DENOISE_DETAIL=1.2",
+    // Multi-scale albedo-guided detail transfer (Laplacian 3/7/15 px).
+    // Gain 2.0 measured +2 HF points over off at 512spp (the old single
+    // 3x3 knob was dead weight: +1.7% for a 67% gain increase). The
+    // reference HF contains substantial MC noise, so the true texture
+    // loss is milder than the raw 0.52x ratio suggests.
+    "RENDER_DENOISE_DETAIL=2.0",
+    "RENDER_DENOISE_DETAIL_SCALES=3",
+    "RENDER_DENOISE_DETAIL_DECAY=0.7",
     "RENDER_DENOISE_NOISE_TARGET=0.12",
     "RENDER_ADAPTIVE_SPP=1",
     "RENDER_ADAPTIVE_MIN=48",
@@ -176,6 +170,12 @@ inline const char* const kCombinedStreetRig[] = {
     "RENDER_SPLIT_WARM=0.08",
     "RENDER_SPLIT_COOL=0.07",
     "RENDER_GRADE_BANDS=0.1004,1.6538,1.7200,2.0000 0.1611,1.1273,1.1915,1.2694 0.1998,0.9589,1.0041,0.9506 0.2270,1.1610,1.1594,1.0324 0.2675,1.2468,1.2331,1.0830 0.3698,1.0257,1.0243,0.9112 0.6783,0.8466,0.8409,0.7814 0.8386,0.8918,0.8736,0.8105 0.8941,0.9692,0.9430,0.8632",
+    // P0 texture clarity — MUST be repeated here: the outdoor profile is a
+    // self-contained parse (the task carries only its keys), and the street
+    // is exactly the view whose grazing floor needs the aniso mips.
+    "RENDER_MIPMAP=1",
+    "RENDER_ANISO=4",
+    "RENDER_LOD_SCALE=0.75",
     nullptr,
 };
 
@@ -205,7 +205,14 @@ inline const char* const kDaylightRig[] = {
     "RENDER_INDIRECT_SCALE=0.48",
     "RENDER_AO=1",
     "RENDER_OIDN=1",
-    "RENDER_DENOISE_DETAIL=1.2",
+    // Multi-scale albedo-guided detail transfer (Laplacian 3/7/15 px).
+    // Gain 2.0 measured +2 HF points over off at 512spp (the old single
+    // 3x3 knob was dead weight: +1.7% for a 67% gain increase). The
+    // reference HF contains substantial MC noise, so the true texture
+    // loss is milder than the raw 0.52x ratio suggests.
+    "RENDER_DENOISE_DETAIL=2.0",
+    "RENDER_DENOISE_DETAIL_SCALES=3",
+    "RENDER_DENOISE_DETAIL_DECAY=0.7",
     "RENDER_DENOISE_NOISE_TARGET=0.12",
     "RENDER_CURVE=0,0 0.1,0.06 0.2,0.13 0.3,0.20 0.4,0.27 0.55,0.50 0.66,0.74 0.85,0.88 1,0.96",
     "RENDER_GRADE_BANDS=0.1004,1.6538,1.7200,2.0000 0.1611,1.1273,1.1915,1.2694 0.1998,0.9589,1.0041,0.9506 0.2270,1.1610,1.1594,1.0324 0.2675,1.2468,1.2331,1.0830 0.3698,1.0257,1.0243,0.9112 0.6783,0.8466,0.8409,0.7814 0.8386,0.8918,0.8736,0.8105 0.8941,0.9692,0.9430,0.8632",

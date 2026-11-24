@@ -15,6 +15,10 @@
 
 // ---- Denoising constants ----
 static constexpr int FILTER_PASSES = 5;  // Steps {1,2,4,8,16} like reference
+// Energy-gain calibration reference: denoiser gates key on this SPP
+// (was a denoiseRadiance local; the gain stage and the SPP-adaptive
+// tolerance both need it).
+static constexpr float SPP_REF = 320.0f;
 
 static inline float luminance(const float3& c) {
     return c.x * 0.299f + c.y * 0.587f + c.z * 0.114f;
@@ -88,542 +92,649 @@ void Photo::postProcess(int shadeOptions, int spp, int denoiseQuality) {
         long v = std::strtol(e, nullptr, 10);
         if (v > 0) sppEff = (int)v;
     }
-    // Denoising (before tone mapping, in linear HDR space)
     bool denoised = false;
-    if ((shadeOptions & DoDenoise) && radiance_Dd && radiance_Ds &&
-        radiance_Id && radiance_Is && Gbuffer) {
-        const size_t n = size_t(width) * height;
+    if (shadeOptions & DoDenoise) denoised = denoiseRadiance(sppEff, denoiseQuality);
+    if (shadeOptions & DoDenoise) denoiseEmission();
+    if (denoised) recompositeFinal();
+    finishDisplay(shadeOptions);
+}
 
-        // ---- Robust per-image statistics (GENERALITY) ----
-        // lumScale: median composite luminance. All AOVs are normalized by it
-        // before filtering, so the denoiser's constants operate on a
-        // canonical scale — scene brightness and light-unit choices no
-        // longer change the denoising behavior.
-        RadianceData* aovs[4] = { radiance_Dd, radiance_Ds, radiance_Id, radiance_Is };
-        std::vector<float> lumSample;
-        lumSample.reserve(n / 7 + 1);
-        for (size_t i = 0; i < n; i += 7)
-            lumSample.push_back(luminance(radiance_Dd[i].radiance) +
-                                luminance(radiance_Ds[i].radiance) +
-                                luminance(radiance_Id[i].radiance) +
-                                luminance(radiance_Is[i].radiance));
-        std::nth_element(lumSample.begin(), lumSample.begin() + lumSample.size() / 2, lumSample.end());
-        float lumScale = fmaxf(lumSample[lumSample.size() / 2], 1e-6f);
+// Denoising (before tone mapping, in linear HDR space).
+bool Photo::denoiseRadiance(int sppEff, int denoiseQuality) {
+    if (!radiance_Dd || !radiance_Ds || !radiance_Id || !radiance_Is || !Gbuffer)
+        return false;
+    const size_t n = size_t(width) * height;
 
-        // Raw MC mean composite luminance — SPP-stable in the luminance
-        // domain (~0.216@4spp ... 0.217@320spp on the bistro interior; the
-        // AOVSTAT log prints the channel-SUM domain, ~3x larger for balanced
-        // light — keep the two domains straight). The per-pixel Bernoulli
-        // misses at low spp leave the MEDIAN degenerate (exactly 0 at
-        // 480p@4spp, where >50% of pixels miss all lights in all 4 samples)
-        // while the mean stays at the converged level.
-        double rawLumSum = 0.0;
-        for (size_t i = 0; i < n; ++i)
-            rawLumSum += luminance(radiance_Dd[i].radiance) +
-                         luminance(radiance_Ds[i].radiance) +
-                         luminance(radiance_Id[i].radiance) +
-                         luminance(radiance_Is[i].radiance);
-        const float rawLumMean = (float)(rawLumSum / (double)n);
-        // Degenerate-median fallback: if the raw median is <= rawMean/16 the
-        // field is spike-dominated (low-spp regime) and the median-based
-        // scale collapses the normalization (all relative gates then operate
-        // on a 1e-6-scale field and the denoised output comes out black).
-        // Fall back to rawMean/8: keeps the normalized field on O(1-100)
-        // values (0.217/8 = 0.027 vs 1e-6), where every relative gate and
-        // absolute floor behaves as tuned. At 320spp the median (0.0779) >
-        // rawMean/16 (0.0136), so the delivered path is untouched.
-        if (lumScale <= rawLumMean / 16.0f)
-            lumScale = rawLumMean / 8.0f;
+    // Robust per-image statistics + relative firefly safety net.
+    double rawLumSum = 0.0;
+    float lumScale = 0.0f;
+    denoiseStatistics(rawLumSum, lumScale);
 
-        // Relative firefly safety net: cap at 8x the AOV's own p99.9
-        // luminance instead of a hard-coded absolute 100.
-        auto relativeClamp = [&](RadianceData* a) {
-            std::vector<float> s;
-            s.reserve(n / 13 + 1);
-            for (size_t i = 0; i < n; i += 13)
-                s.push_back(luminance(a[i].radiance));
-            std::nth_element(s.begin(), s.begin() + s.size() * 999 / 1000, s.end());
-            float p999 = s[size_t(s.size() * 999 / 1000)];
-            spatialClamp(a, width, height, fmaxf(20.0f, 8.0f * p999));
-        };
-        relativeClamp(radiance_Dd);
-        relativeClamp(radiance_Ds);
-        relativeClamp(radiance_Id);
-        relativeClamp(radiance_Is);
+    // ---- SPP-adaptive tolerance ----
+    // At low spp the per-pixel signal is Bernoulli-spike dominated: most
+    // pixels miss the lights entirely and the legitimate energy sits in a
+    // few spikes. The 6x local-median firefly gate (tuned at 320spp) then
+    // clamps REAL signal, and log-domain averaging additionally
+    // underestimates heavy-tailed data (Jensen: geometric mean <<
+    // arithmetic mean). Both collapse the output brightness (measured:
+    // denoised median 0.467@320 -> 0.207@4, raw radMean constant).
+    // (a) widen the firefly gates by k = sqrt(SPP_REF/spp) — a
+    //     legitimate spike's excess over the local median grows ~1/spp;
+    // (b) an energy-conserving gain at the end restores the 320spp
+    //     OUTPUT level (retention-corrected, NOT the raw MC mean — the
+    //     delivered 320 calibration includes the denoiser's own ~23%
+    //     retention loss). At spp >= 320 the gain is exactly 1.0.
+    // The relative varMed step gates and sigmaL floors are left alone:
+    // Var/varMed and the normalized-luminance floors are spp-invariant.
+    float kSpp = std::sqrt(SPP_REF / fmaxf((float)sppEff, 1.0f));
+    kSpp = std::min(8.0f, std::max(1.0f, kSpp));
+    const float ffGate = 6.0f * kSpp;
 
-        // ---- SPP-adaptive tolerance ----
-        // At low spp the per-pixel signal is Bernoulli-spike dominated: most
-        // pixels miss the lights entirely and the legitimate energy sits in a
-        // few spikes. The 6x local-median firefly gate (tuned at 320spp) then
-        // clamps REAL signal, and log-domain averaging additionally
-        // underestimates heavy-tailed data (Jensen: geometric mean <<
-        // arithmetic mean). Both collapse the output brightness (measured:
-        // denoised median 0.467@320 -> 0.207@4, raw radMean constant).
-        // (a) widen the firefly gates by k = sqrt(SPP_REF/spp) — a
-        //     legitimate spike's excess over the local median grows ~1/spp;
-        // (b) an energy-conserving gain at the end restores the 320spp
-        //     OUTPUT level (retention-corrected, NOT the raw MC mean — the
-        //     delivered 320 calibration includes the denoiser's own ~23%
-        //     retention loss). At spp >= 320 the gain is exactly 1.0.
-        // The relative varMed step gates and sigmaL floors are left alone:
-        // Var/varMed and the normalized-luminance floors are spp-invariant.
-        static constexpr float SPP_REF = 320.0f;
-        float kSpp = std::sqrt(SPP_REF / fmaxf((float)sppEff, 1.0f));
-        kSpp = std::min(8.0f, std::max(1.0f, kSpp));
-        const float ffGate = 6.0f * kSpp;
-
-        // (rawLumSum / rawLumMean: computed above with lumScale — it is the
-        // energy-conservation reference for the gain at the end of the
-        // pipeline; linear filtering preserves the mean, only the nonlinear
-        // clamps and log-domain averaging shift it.)
-        // Diagnostic: Var distribution before filtering (full-frame scans —
-        // RENDER_VERBOSE only; off by default for the per-chunk preview path)
-        if (renderVerbose()) {
-            double sVar=0,sVar2=0,sRad=0; float mn=1e30f,mx=0;
-            for(size_t i=0;i<size_t(width)*height;++i){
-                float v=radiance_Dd[i].Var; sVar+=v; sVar2+=double(v)*v;
-                float r=luminance(radiance_Dd[i].radiance); sRad+=r;
-                mn=fminf(mn,v); mx=fmaxf(mx,v);
-            }
-            size_t n=size_t(width)*height;
-            fprintf(stderr,"VARDIAG Dd: mean=%.6f std=%.6f min=%.6f max=%.6f radMean=%.3f\n",
-                    sVar/n,sqrt(sVar2/n-(sVar/n)*(sVar/n)),mn,mx,sRad/n);
-            size_t posValid=0;
-            for(size_t i=0;i<n;++i) if(std::isfinite(Gbuffer[i].position.x)&&glm::length(Gbuffer[i].position)>1e-6f) posValid++;
-            fprintf(stderr,"GBUF: posValid=%zu/%zu (%.1f%%)\n",posValid,n,100.0*posValid/n);
+    // (rawLumSum / rawLumMean: computed above with lumScale — it is the
+    // energy-conservation reference for the gain at the end of the
+    // pipeline; linear filtering preserves the mean, only the nonlinear
+    // clamps and log-domain averaging shift it.)
+    // Diagnostic: Var distribution before filtering (full-frame scans —
+    // RENDER_VERBOSE only; off by default for the per-chunk preview path)
+    if (renderVerbose()) {
+        double sVar=0,sVar2=0,sRad=0; float mn=1e30f,mx=0;
+        for(size_t i=0;i<size_t(width)*height;++i){
+            float v=radiance_Dd[i].Var; sVar+=v; sVar2+=double(v)*v;
+            float r=luminance(radiance_Dd[i].radiance); sRad+=r;
+            mn=fminf(mn,v); mx=fmaxf(mx,v);
         }
-        // ---- P1/P2: sun matte (sunliness) for the sun-keyed split-tone ----
-        // Per-pixel direct-sun fraction of the illumination: blurred for
-        // stability (the mask itself already carries the soft-shadow ramp),
-        // normalized by the pixel's total raw luminance. 1 = sunlit,
-        // 0 = shade — the warm/cool split keys on THIS, not on luma.
-        if (splitKeySun && sunMask) {
-            sunliness.assign(n, 0.0f);
-            std::vector<float> mb(n, 0.0f);
-            for (int y = 0; y < height; ++y)
-            for (int x = 0; x < width; ++x) {
-                float acc = 0.0f; int cnt = 0;
-                for (int dy = -1; dy <= 1; ++dy)
-                for (int dx = -1; dx <= 1; ++dx) {
-                    int sx = std::min(width - 1, std::max(0, x + dx));
-                    int sy = std::min(height - 1, std::max(0, y + dy));
-                    acc += sunMask[size_t(sy) * width + sx];
-                    ++cnt;
-                }
-                mb[size_t(y) * width + x] = acc / float(cnt);
-            }
-            double sSum = 0.0;
-            for (size_t i = 0; i < n; ++i) {
-                float tot = luminance(radiance_Dd[i].radiance) +
-                            luminance(radiance_Ds[i].radiance) +
-                            luminance(radiance_Id[i].radiance) +
-                            luminance(radiance_Is[i].radiance) +
-                            (channels.emission ? luminance(float3(channels.emission[i]))
-                                               : 0.0f);
-                sunliness[i] = std::min(1.0f, mb[i] / (tot + 1e-4f));
-                sSum += sunliness[i];
-            }
-            fprintf(stderr, "SUNMASK: sun-keyed split-tone (%zu px, mean sunliness %.3f)\n",
-                    n, n ? sSum / n : 0.0);
-            fflush(stderr);
-        }
+        size_t n=size_t(width)*height;
+        fprintf(stderr,"VARDIAG Dd: mean=%.6f std=%.6f min=%.6f max=%.6f radMean=%.3f\n",
+                sVar/n,sqrt(sVar2/n-(sVar/n)*(sVar/n)),mn,mx,sRad/n);
+        size_t posValid=0;
+        for(size_t i=0;i<n;++i) if(std::isfinite(Gbuffer[i].position.x)&&glm::length(Gbuffer[i].position)>1e-6f) posValid++;
+        fprintf(stderr,"GBUF: posValid=%zu/%zu (%.1f%%)\n",posValid,n,100.0*posValid/n);
+    }
 
-        // ---- P4c: Intel Open Image Denoise (RENDER_OIDN=1) ----
-        // Quality 3 (server final chunk) runs OIDN INSTEAD of the custom
-        // NL-means chain (the recomposite prefers oidnColor); quality 2 (CLI
-        // delivery) keeps BOTH — the calibrated path is byte-identical.
+    buildSunliness();
+
 #ifdef RENDERER_HAS_OIDN
-        {
-            // Per-call env read (NOT cached): presets install rig env at
-            // runtime, and a re-render after `preset`/`setenv` must see it.
-            const bool oidnOn = [] {
-                const char* e = std::getenv("RENDER_OIDN");
-                return e && e[0] == '1';
-            }();
-            if (oidnOn && denoiseQuality >= 2 && Gbuffer) {
-                std::vector<float> color(n * 3), albedo(n * 3), normal(n * 3), out(n * 3);
-                for (size_t i = 0; i < n; ++i) {
-                    float3 c = radiance_Dd[i].radiance + radiance_Ds[i].radiance +
-                               radiance_Id[i].radiance + radiance_Is[i].radiance;
-                    c += channels.emission ? float3(channels.emission[i]) : float3(0.0f);
-                    color[i*3+0] = c.x; color[i*3+1] = c.y; color[i*3+2] = c.z;
-                    float3 a = Gbuffer[i].baseColor;
-                    albedo[i*3+0] = a.x; albedo[i*3+1] = a.y; albedo[i*3+2] = a.z;
-                    float3 nn = Gbuffer[i].shapeNormal;
-                    normal[i*3+0] = nn.x; normal[i*3+1] = nn.y; normal[i*3+2] = nn.z;
-                }
-                // Device selection honours RENDER_OIDN_DEVICE=cpu|gpu
-                // (oidnRunRT: CUDA device with device-buffer staging and a
-                // byte-identical CPU fallback — the prebuilt OIDN 2.2 package
-                // ships libOpenImageDenoise_device_cuda).
-                if (oidnRunRT(color, albedo, normal, out, width, height)) {
-                    oidnColor = out;
-                    fprintf(stderr, "OIDN: denoised %dx%d (RT filter, albedo+normal guides)\n", width, height);
-                    fflush(stderr);
-                }
-            }
-        }
+    // ---- P4c: Intel Open Image Denoise (RENDER_OIDN=1) ----
+    // Quality 3 (server final chunk) runs OIDN INSTEAD of the custom
+    // NL-means chain (the recomposite prefers oidnColor); quality 2 (CLI
+    // delivery) keeps BOTH — the calibrated path is byte-identical.
+    runOidnPass(denoiseQuality);
 #endif
 
-        // denoiseQuality 3 with a successful OIDN run: the NL-means chain
-        // below is redundant (the recomposite prefers oidnColor) — skip its
-        // 28 filterRadiance calls and the helper statistics entirely.
-        const bool oidnUsed = denoiseQuality >= 3 &&
-                              oidnColor.size() == size_t(width) * height * 3;
-        const bool nlMeans = !oidnUsed;
-        const int nlPasses = !nlMeans ? 0
-                           : (denoiseQuality == 1 ? 1 : FILTER_PASSES + 2);
+    // denoiseQuality 3 with a successful OIDN run: the NL-means chain
+    // below is redundant (the recomposite prefers oidnColor) — skip its
+    // 28 filterRadiance calls and the helper statistics entirely.
+    const bool oidnUsed = denoiseQuality >= 3 &&
+                          oidnColor.size() == size_t(width) * height * 3;
+    const bool nlMeans = !oidnUsed;
+    const int nlPasses = !nlMeans ? 0
+                       : (denoiseQuality == 1 ? 1 : FILTER_PASSES + 2);
 
-        // Tier 0: snapshot the TRUE MC sample variance (E[X²]−E[X]² over the
-        // spp samples) BEFORE filterVar replaces it with spatial variance —
-        // the noise-guided blend needs the sampling noise, and spatial
-        // variance conflates texture with noise (high on texture at any spp).
-        std::vector<float> mcVar[4];
-        if (nlMeans) {
-            for (int c = 0; c < 4; ++c) {
-                mcVar[c].resize(n);
-                for (size_t i = 0; i < n; ++i) mcVar[c][i] = aovs[c][i].Var;
+    nlMeansFilter(n, lumScale, ffGate, nlMeans, nlPasses, denoiseQuality);
+    applyPositionAO(n);
+    albedoDetailTransfer(n);
+    applyEnergyGain(n, rawLumSum, lumScale, kSpp, nlMeans, sppEff);
+    return true;
+}
+
+// ---- denoiseRadiance stages. Pure extraction: same order, same
+// ---- numerics; locals (n, aovs) rebuilt per stage. See image.h.
+
+void Photo::denoiseStatistics(double& rawLumSum, float& lumScale) {
+    const size_t n = size_t(width) * height;
+    // ---- Robust per-image statistics (GENERALITY) ----
+    // lumScale: median composite luminance. All AOVs are normalized by it
+    // before filtering, so the denoiser's constants operate on a
+    // canonical scale — scene brightness and light-unit choices no
+    // longer change the denoising behavior.
+    std::vector<float> lumSample;
+    lumSample.reserve(n / 7 + 1);
+    for (size_t i = 0; i < n; i += 7)
+        lumSample.push_back(luminance(radiance_Dd[i].radiance) +
+                            luminance(radiance_Ds[i].radiance) +
+                            luminance(radiance_Id[i].radiance) +
+                            luminance(radiance_Is[i].radiance));
+    std::nth_element(lumSample.begin(), lumSample.begin() + lumSample.size() / 2, lumSample.end());
+    lumScale = fmaxf(lumSample[lumSample.size() / 2], 1e-6f);
+
+    // Raw MC mean composite luminance — SPP-stable in the luminance
+    // domain (~0.216@4spp ... 0.217@320spp on the bistro interior; the
+    // AOVSTAT log prints the channel-SUM domain, ~3x larger for balanced
+    // light — keep the two domains straight). The per-pixel Bernoulli
+    // misses at low spp leave the MEDIAN degenerate (exactly 0 at
+    // 480p@4spp, where >50% of pixels miss all lights in all 4 samples)
+    // while the mean stays at the converged level.
+    rawLumSum = 0.0;
+    for (size_t i = 0; i < n; ++i)
+        rawLumSum += luminance(radiance_Dd[i].radiance) +
+                     luminance(radiance_Ds[i].radiance) +
+                     luminance(radiance_Id[i].radiance) +
+                     luminance(radiance_Is[i].radiance);
+    const float rawLumMean = (float)(rawLumSum / (double)n);
+    // Degenerate-median fallback: if the raw median is <= rawMean/16 the
+    // field is spike-dominated (low-spp regime) and the median-based
+    // scale collapses the normalization (all relative gates then operate
+    // on a 1e-6-scale field and the denoised output comes out black).
+    // Fall back to rawMean/8: keeps the normalized field on O(1-100)
+    // values (0.217/8 = 0.027 vs 1e-6), where every relative gate and
+    // absolute floor behaves as tuned. At 320spp the median (0.0779) >
+    // rawMean/16 (0.0136), so the delivered path is untouched.
+    if (lumScale <= rawLumMean / 16.0f)
+        lumScale = rawLumMean / 8.0f;
+
+    // Relative firefly safety net: cap at 8x the AOV's own p99.9
+    // luminance instead of a hard-coded absolute 100.
+    auto relativeClamp = [&](RadianceData* a) {
+        std::vector<float> s;
+        s.reserve(n / 13 + 1);
+        for (size_t i = 0; i < n; i += 13)
+            s.push_back(luminance(a[i].radiance));
+        std::nth_element(s.begin(), s.begin() + s.size() * 999 / 1000, s.end());
+        float p999 = s[size_t(s.size() * 999 / 1000)];
+        spatialClamp(a, width, height, fmaxf(20.0f, 8.0f * p999));
+    };
+    relativeClamp(radiance_Dd);
+    relativeClamp(radiance_Ds);
+    relativeClamp(radiance_Id);
+    relativeClamp(radiance_Is);
+}
+
+// ---- P1/P2: sun matte (sunliness) for the sun-keyed split-tone ----
+// Per-pixel direct-sun fraction of the illumination: blurred for
+// stability (the mask itself already carries the soft-shadow ramp),
+// normalized by the pixel's total raw luminance. 1 = sunlit,
+// 0 = shade — the warm/cool split keys on THIS, not on luma.
+void Photo::buildSunliness() {
+    const size_t n = size_t(width) * height;
+    if (splitKeySun && sunMask) {
+        sunliness.assign(n, 0.0f);
+        std::vector<float> mb(n, 0.0f);
+        for (int y = 0; y < height; ++y)
+        for (int x = 0; x < width; ++x) {
+            float acc = 0.0f; int cnt = 0;
+            for (int dy = -1; dy <= 1; ++dy)
+            for (int dx = -1; dx <= 1; ++dx) {
+                int sx = std::min(width - 1, std::max(0, x + dx));
+                int sy = std::min(height - 1, std::max(0, y + dy));
+                acc += sunMask[size_t(sy) * width + sx];
+                ++cnt;
             }
+            mb[size_t(y) * width + x] = acc / float(cnt);
+        }
+        double sSum = 0.0;
+        for (size_t i = 0; i < n; ++i) {
+            float tot = luminance(radiance_Dd[i].radiance) +
+                        luminance(radiance_Ds[i].radiance) +
+                        luminance(radiance_Id[i].radiance) +
+                        luminance(radiance_Is[i].radiance) +
+                        (channels.emission ? luminance(float3(channels.emission[i]))
+                                           : 0.0f);
+            sunliness[i] = std::min(1.0f, mb[i] / (tot + 1e-4f));
+            sSum += sunliness[i];
+        }
+        fprintf(stderr, "SUNMASK: sun-keyed split-tone (%zu px, mean sunliness %.3f)\n",
+                n, n ? sSum / n : 0.0);
+        fflush(stderr);
+    }
+}
+
+#ifdef RENDERER_HAS_OIDN
+void Photo::runOidnPass(int denoiseQuality) {
+    const size_t n = size_t(width) * height;
+    // Per-call env read (NOT cached): presets install rig env at
+    // runtime, and a re-render after `preset`/`setenv` must see it.
+    const bool oidnOn = [] {
+        const char* e = std::getenv("RENDER_OIDN");
+        return e && e[0] == '1';
+    }();
+    if (oidnOn && denoiseQuality >= 2 && Gbuffer) {
+        std::vector<float> color(n * 3), albedo(n * 3), normal(n * 3), out(n * 3);
+        for (size_t i = 0; i < n; ++i) {
+            float3 c = radiance_Dd[i].radiance + radiance_Ds[i].radiance +
+                       radiance_Id[i].radiance + radiance_Is[i].radiance;
+            c += channels.emission ? float3(channels.emission[i]) : float3(0.0f);
+            color[i*3+0] = c.x; color[i*3+1] = c.y; color[i*3+2] = c.z;
+            float3 a = Gbuffer[i].baseColor;
+            albedo[i*3+0] = a.x; albedo[i*3+1] = a.y; albedo[i*3+2] = a.z;
+            float3 nn = Gbuffer[i].shapeNormal;
+            normal[i*3+0] = nn.x; normal[i*3+1] = nn.y; normal[i*3+2] = nn.z;
+        }
+        // Device selection honours RENDER_OIDN_DEVICE=cpu|gpu
+        // (oidnRunRT: CUDA device with device-buffer staging and a
+        // byte-identical CPU fallback — the prebuilt OIDN 2.2 package
+        // ships libOpenImageDenoise_device_cuda).
+        if (oidnRunRT(color, albedo, normal, out, width, height)) {
+            oidnColor = out;
+            fprintf(stderr, "OIDN: denoised %dx%d (RT filter, albedo+normal guides)\n", width, height);
+            fflush(stderr);
+        }
+    }
+}
+#endif
+
+void Photo::nlMeansFilter(size_t n, float lumScale, float ffGate, bool nlMeans,
+                          int nlPasses, int denoiseQuality) {
+    RadianceData* aovs[4] = { radiance_Dd, radiance_Ds, radiance_Id, radiance_Is };
+    // Tier 0: snapshot the TRUE MC sample variance (E[X²]−E[X]² over the
+    // spp samples) BEFORE filterVar replaces it with spatial variance —
+    // the noise-guided blend needs the sampling noise, and spatial
+    // variance conflates texture with noise (high on texture at any spp).
+    std::vector<float> mcVar[4];
+    if (nlMeans) {
+        for (int c = 0; c < 4; ++c) {
+            mcVar[c].resize(n);
+            for (size_t i = 0; i < n; ++i) mcVar[c][i] = aovs[c][i].Var;
+        }
+    }
+
+    // Tier 1: re-estimate per-pixel variance (reference filterVar)
+    if (nlMeans) {
+    filterVar(radiance_Dd, width, height);
+    filterVar(radiance_Ds, width, height);
+    filterVar(radiance_Id, width, height);
+    filterVar(radiance_Is, width, height);
+    fprintf(stderr, "DENOISE start\n"); fflush(stderr);
+    // Firefly pre-clamp on all channels: isolated outliers poison both the
+    // weighted mean and the variance estimates used by the filter.
+    fireflyClamp(radiance_Dd, width, height, ffGate);
+    fireflyClamp(radiance_Ds, width, height, ffGate);
+    fireflyClamp(radiance_Id, width, height, ffGate);
+    fireflyClamp(radiance_Is, width, height, ffGate);
+
+    // Normalize to median composite luminance 1.0 (scale-invariance).
+    const float invScale = 1.0f / lumScale;
+    for (int c = 0; c < 4; ++c)
+        for (size_t i = 0; i < n; ++i) {
+            aovs[c][i].radiance *= invScale;
+            aovs[c][i].Var *= invScale * invScale;
+            mcVar[c][i] *= invScale * invScale;
         }
 
-        // Tier 1: re-estimate per-pixel variance (reference filterVar)
-        if (nlMeans) {
-        filterVar(radiance_Dd, width, height);
-        filterVar(radiance_Ds, width, height);
-        filterVar(radiance_Id, width, height);
-        filterVar(radiance_Is, width, height);
-        fprintf(stderr, "DENOISE start\n"); fflush(stderr);
-        // Firefly pre-clamp on all channels: isolated outliers poison both the
-        // weighted mean and the variance estimates used by the filter.
+    // Per-AOV median Var AFTER filtering-scale normalization — the
+    // reference for all relative variance thresholds (spp-invariant).
+    float varMed[4] = {1.0f, 1.0f, 1.0f, 1.0f};
+    for (int c = 0; c < 4; ++c) {
+        std::vector<float> s;
+        s.reserve(n / 7 + 1);
+        for (size_t i = 0; i < n; i += 7) s.push_back(aovs[c][i].Var);
+        std::nth_element(s.begin(), s.begin() + s.size() / 2, s.end());
+        varMed[c] = fmaxf(s[s.size() / 2], 1e-12f);
+    }
+
+    // Multi-scale edge-aware filtering. The radiance term carries a sigL
+    // FLOOR (flat regions must average) and the ALBEDO-SIMILARITY weight
+    // (texture must not average) — see getDenoiseWeight.
+    // denoiseQuality: full (default) runs the calibrated FILTER_PASSES+2
+    // ladder; quick (progressive preview chunks) runs ONE pass — the
+    // intermediate frames are transient, and 7 passes × 4 AOVs × 25 taps
+    // is the single largest CPU item in the per-chunk pipeline.
+    for (int pass = 0; pass < nlPasses; ++pass) {
+        filterRadiance(radiance_Dd, Gbuffer, width, height, false, pass, varMed[0], mcVar[0].data());
+        filterRadiance(radiance_Ds, Gbuffer, width, height, true,  pass, varMed[1], mcVar[1].data());
+        filterRadiance(radiance_Id, Gbuffer, width, height, false, pass, varMed[2], mcVar[2].data());
+        filterRadiance(radiance_Is, Gbuffer, width, height, true,  pass, varMed[3], mcVar[3].data());
+    }
+
+    // Denormalize back to scene units.
+    if (nlMeans)
+    for (int c = 0; c < 4; ++c)
+        for (size_t i = 0; i < n; ++i) {
+            aovs[c][i].radiance *= lumScale;
+            aovs[c][i].Var *= lumScale * lumScale;
+        }
+    } // nlMeans
+    // Post-filter firefly cleanup: the edge-stopping weights deliberately
+    // keep silhouette pixels un-averaged, so grazing-angle specular
+    // fireflies along object edges survive the multi-pass filter. The
+    // relative gates (6x local median AND 6x local mean) spare coherent
+    // bright structures (lamp cores) and only clamp isolated specks.
+    // (quick quality keeps the FIRST fireflyClamp above and skips this
+    // second one — the frame is transient.)
+    if (nlMeans && denoiseQuality >= 2) {
         fireflyClamp(radiance_Dd, width, height, ffGate);
         fireflyClamp(radiance_Ds, width, height, ffGate);
         fireflyClamp(radiance_Id, width, height, ffGate);
         fireflyClamp(radiance_Is, width, height, ffGate);
+    }
+}
 
-        // Normalize to median composite luminance 1.0 (scale-invariance).
-        const float invScale = 1.0f / lumScale;
-        for (int c = 0; c < 4; ++c)
-            for (size_t i = 0; i < n; ++i) {
-                aovs[c][i].radiance *= invScale;
-                aovs[c][i].Var *= invScale * invScale;
-                mcVar[c][i] *= invScale * invScale;
+void Photo::applyPositionAO(size_t n) {
+    RadianceData* aovs[4] = { radiance_Dd, radiance_Ds, radiance_Id, radiance_Is };
+    // ---- P4a: position-based ambient occlusion (contact shadows) ----
+    // The path tracer captures large-scale occlusion through shadow rays,
+    // but small-scale contact darkening (door reveals, crevices, object
+    // bases) needs many bounces to converge and is missing at our depths
+    // (the official reference shows it). Horizon-style AO from the
+    // first-hit world positions: a neighbour OFF the tangent plane on the
+    // normal side is an occluder; flat-surface neighbours lie IN the
+    // plane and never self-occlude. Applied to the INDIRECT channels only
+    // (direct lighting already has traced shadows).
+    // RENDER_AO=1 to enable; RADIUS px; STRENGTH 0..1; TAPS per pixel.
+    // Per-call env read (see the OIDN note above).
+    const bool aoOn = [] {
+        const char* e = std::getenv("RENDER_AO");
+        return e && e[0] == '1';
+    }();
+    if (aoOn && Gbuffer) {
+        float aoStrength = 0.6f, aoRadius = 12.0f;
+        int aoTaps = 12;
+        if (const char* e = std::getenv("RENDER_AO_STRENGTH")) aoStrength = std::strtof(e, nullptr);
+        if (const char* e = std::getenv("RENDER_AO_RADIUS"))   aoRadius   = std::strtof(e, nullptr);
+        if (const char* e = std::getenv("RENDER_AO_TAPS"))     aoTaps     = std::max(4, std::atoi(e));
+        std::vector<float> ao(n, 1.0f);
+        for (int y = 0; y < height; ++y)
+        for (int x = 0; x < width; ++x) {
+            size_t i = size_t(y) * width + x;
+            float3 pp = Gbuffer[i].position;
+            if (!std::isfinite(pp.x) || glm::length(pp) < 1e-6f) continue;
+            const float3 N = Gbuffer[i].shapeNormal;
+            // per-pixel rotation (hash) so the tap pattern does not band
+            uint32_t hsh = uint32_t(x * 73856093) ^ uint32_t(y * 19349663);
+            float rot = (hsh & 1023u) * (2.0f * PI / 1024.0f);
+            float occ = 0.0f, wsum = 0.0f;
+            for (int t = 0; t < aoTaps; ++t) {
+                float ang = rot + t * (2.0f * PI / aoTaps) * 2.4f;   // golden-ish spread
+                float rr  = aoRadius * std::sqrt((t + 0.5f) / aoTaps);
+                int sx = x + int(rr * std::cos(ang));
+                int sy = y + int(rr * std::sin(ang));
+                if (sx < 0 || sx >= width || sy < 0 || sy >= height) continue;
+                float3 pq = Gbuffer[size_t(sy) * width + sx].position;
+                if (!std::isfinite(pq.x) || glm::length(pq) < 1e-6f) continue;
+                float3 diff = pq - pp;
+                float dist = glm::length(diff);
+                if (dist > aoRadius * 2.0f || dist < 1e-5f) continue;
+                // signed height above the tangent plane, normalized
+                float proj = glm::dot(diff, N) / dist;
+                // occluder: neighbour well above the plane (concave
+                // corner / object base), fading with distance
+                float w = std::max(0.0f, proj - 0.15f) / 0.85f;
+                w *= 1.0f - std::min(1.0f, dist / (aoRadius * 2.0f));
+                occ += w;
+                wsum += 1.0f;
             }
-
-        // Per-AOV median Var AFTER filtering-scale normalization — the
-        // reference for all relative variance thresholds (spp-invariant).
-        float varMed[4] = {1.0f, 1.0f, 1.0f, 1.0f};
-        for (int c = 0; c < 4; ++c) {
-            std::vector<float> s;
-            s.reserve(n / 7 + 1);
-            for (size_t i = 0; i < n; i += 7) s.push_back(aovs[c][i].Var);
-            std::nth_element(s.begin(), s.begin() + s.size() / 2, s.end());
-            varMed[c] = fmaxf(s[s.size() / 2], 1e-12f);
+            if (wsum > 0.0f) occ /= wsum;
+            ao[i] = 1.0f - aoStrength * std::min(1.0f, occ * 2.0f);
         }
-
-        // Multi-scale edge-aware filtering. The radiance term carries a sigL
-        // FLOOR (flat regions must average) and the ALBEDO-SIMILARITY weight
-        // (texture must not average) — see getDenoiseWeight.
-        // denoiseQuality: full (default) runs the calibrated FILTER_PASSES+2
-        // ladder; quick (progressive preview chunks) runs ONE pass — the
-        // intermediate frames are transient, and 7 passes × 4 AOVs × 25 taps
-        // is the single largest CPU item in the per-chunk pipeline.
-        for (int pass = 0; pass < nlPasses; ++pass) {
-            filterRadiance(radiance_Dd, Gbuffer, width, height, false, pass, varMed[0], mcVar[0].data());
-            filterRadiance(radiance_Ds, Gbuffer, width, height, true,  pass, varMed[1], mcVar[1].data());
-            filterRadiance(radiance_Id, Gbuffer, width, height, false, pass, varMed[2], mcVar[2].data());
-            filterRadiance(radiance_Is, Gbuffer, width, height, true,  pass, varMed[3], mcVar[3].data());
-        }
-
-        // Denormalize back to scene units.
-        if (nlMeans)
-        for (int c = 0; c < 4; ++c)
+        for (int c = 2; c < 4; ++c)   // Id, Is = indirect diffuse/specular
+            for (size_t i = 0; i < n; ++i)
+                aovs[c][i].radiance *= ao[i];
+        // OIDN path: its composite replaces the AOV sum downstream,
+        // so apply the AO there too — weighted by the pixel's
+        // INDIRECT fraction (AO must not darken direct sunlight).
+        if (oidnColor.size() == n * 3) {
             for (size_t i = 0; i < n; ++i) {
-                aovs[c][i].radiance *= lumScale;
-                aovs[c][i].Var *= lumScale * lumScale;
+                float idl = luminance(radiance_Id[i].radiance) +
+                            luminance(radiance_Is[i].radiance);
+                float tot = idl + luminance(radiance_Dd[i].radiance) +
+                            luminance(radiance_Ds[i].radiance) +
+                            (channels.emission ? luminance(float3(channels.emission[i])) : 0.0f);
+                float frac = (tot > 1e-6f) ? std::min(1.0f, idl / tot) : 0.0f;
+                float m = 1.0f - (1.0f - ao[i]) * frac;
+                oidnColor[i*3+0] *= m;
+                oidnColor[i*3+1] *= m;
+                oidnColor[i*3+2] *= m;
             }
-        } // nlMeans
-        // Post-filter firefly cleanup: the edge-stopping weights deliberately
-        // keep silhouette pixels un-averaged, so grazing-angle specular
-        // fireflies along object edges survive the multi-pass filter. The
-        // relative gates (6x local median AND 6x local mean) spare coherent
-        // bright structures (lamp cores) and only clamp isolated specks.
-        // (quick quality keeps the FIRST fireflyClamp above and skips this
-        // second one — the frame is transient.)
-        if (nlMeans && denoiseQuality >= 2) {
-            fireflyClamp(radiance_Dd, width, height, ffGate);
-            fireflyClamp(radiance_Ds, width, height, ffGate);
-            fireflyClamp(radiance_Id, width, height, ffGate);
-            fireflyClamp(radiance_Is, width, height, ffGate);
         }
+        fprintf(stderr, "AO: position-based (radius=%.0fpx strength=%.2f taps=%d)\n",
+                aoRadius, aoStrength, aoTaps);
+        fflush(stderr);
+    }
+}
 
-        // ---- P4a: position-based ambient occlusion (contact shadows) ----
-        // The path tracer captures large-scale occlusion through shadow rays,
-        // but small-scale contact darkening (door reveals, crevices, object
-        // bases) needs many bounces to converge and is missing at our depths
-        // (the official reference shows it). Horizon-style AO from the
-        // first-hit world positions: a neighbour OFF the tangent plane on the
-        // normal side is an occluder; flat-surface neighbours lie IN the
-        // plane and never self-occlude. Applied to the INDIRECT channels only
-        // (direct lighting already has traced shadows).
-        // RENDER_AO=1 to enable; RADIUS px; STRENGTH 0..1; TAPS per pixel.
-        {
-            // Per-call env read (see the OIDN note above).
-            const bool aoOn = [] {
-                const char* e = std::getenv("RENDER_AO");
-                return e && e[0] == '1';
-            }();
-            if (aoOn && Gbuffer) {
-                float aoStrength = 0.6f, aoRadius = 12.0f;
-                int aoTaps = 12;
-                if (const char* e = std::getenv("RENDER_AO_STRENGTH")) aoStrength = std::strtof(e, nullptr);
-                if (const char* e = std::getenv("RENDER_AO_RADIUS"))   aoRadius   = std::strtof(e, nullptr);
-                if (const char* e = std::getenv("RENDER_AO_TAPS"))     aoTaps     = std::max(4, std::atoi(e));
-                std::vector<float> ao(n, 1.0f);
-                for (int y = 0; y < height; ++y)
+void Photo::albedoDetailTransfer(size_t n) {
+    // ---- Multi-scale albedo-guided detail transfer ----
+    // The multi-pass filter smooths low-contrast shading texture
+    // (weathering marks, grime, cobblestone grain) that the albedo-
+    // similarity gate cannot protect — the gate stops ALBEDO EDGES, not
+    // albedo-matched texture. The first-hit albedo in the G-buffer is
+    // noise-free, so its multi-scale detail (Laplacian pyramid of box
+    // blurs at radii 1/3/7 px) is pure texture: transfer it back onto
+    // the denoised radiance multiplicatively (per channel, hue-
+    // preserving). Linear in the four AOVs → applying per-AOV equals
+    // applying to their sum; oidnColor (the OIDN-only final chunk used
+    // by the viewer's refine tier) gets the same factors, otherwise the
+    // detail is silently discarded on that path.
+    //
+    // The previous single 3x3 residual could not restore the mid-
+    // frequency band the ladder removes: measured +1.7% HF for a 67%
+    // gain increase, while the denoiser erosion is 0.52x overall
+    // (floor 0.42x). The pyramid restores the 2-8 px band.
+    //   RENDER_DENOISE_DETAIL: base gain (0 = off, default 0)
+    //   RENDER_DENOISE_DETAIL_SCALES: pyramid levels (default 3)
+    //   RENDER_DENOISE_DETAIL_DECAY: per-level weight decay (default .7)
+    float detailGain = -1.0f;
+    if (const char* e = std::getenv("RENDER_DENOISE_DETAIL"))
+        detailGain = fmaxf(0.0f, std::strtof(e, nullptr));
+    if (detailGain > 0.0f && Gbuffer) {
+        int detailScales = 3;
+        if (const char* e = std::getenv("RENDER_DENOISE_DETAIL_SCALES"))
+            detailScales = std::min(4, std::max(1, std::atoi(e)));
+        float decay = 0.7f;
+        if (const char* e = std::getenv("RENDER_DENOISE_DETAIL_DECAY"))
+            decay = std::min(1.0f, std::max(0.0f, std::strtof(e, nullptr)));
+        std::vector<float3> alb(n);
+        for (size_t i = 0; i < n; ++i) alb[i] = Gbuffer[i].baseColor;
+        // Separable box blur with clamped edges, O(n) sliding window.
+        auto boxBlur = [&](const std::vector<float3>& src,
+                           std::vector<float3>& dst, int radius) {
+            const int taps = 2 * radius + 1;
+            std::vector<float3> tmp(n);
+            for (int y = 0; y < height; ++y) {
+                float3 acc(0.0f);
+                const size_t row = size_t(y) * width;
+                for (int x = -radius; x <= radius; ++x) {
+                    const int sx = std::min(width - 1, std::max(0, x));
+                    acc += src[row + size_t(sx)];
+                }
                 for (int x = 0; x < width; ++x) {
-                    size_t i = size_t(y) * width + x;
-                    float3 pp = Gbuffer[i].position;
-                    if (!std::isfinite(pp.x) || glm::length(pp) < 1e-6f) continue;
-                    const float3 N = Gbuffer[i].shapeNormal;
-                    // per-pixel rotation (hash) so the tap pattern does not band
-                    uint32_t hsh = uint32_t(x * 73856093) ^ uint32_t(y * 19349663);
-                    float rot = (hsh & 1023u) * (2.0f * PI / 1024.0f);
-                    float occ = 0.0f, wsum = 0.0f;
-                    for (int t = 0; t < aoTaps; ++t) {
-                        float ang = rot + t * (2.0f * PI / aoTaps) * 2.4f;   // golden-ish spread
-                        float rr  = aoRadius * std::sqrt((t + 0.5f) / aoTaps);
-                        int sx = x + int(rr * std::cos(ang));
-                        int sy = y + int(rr * std::sin(ang));
-                        if (sx < 0 || sx >= width || sy < 0 || sy >= height) continue;
-                        float3 pq = Gbuffer[size_t(sy) * width + sx].position;
-                        if (!std::isfinite(pq.x) || glm::length(pq) < 1e-6f) continue;
-                        float3 diff = pq - pp;
-                        float dist = glm::length(diff);
-                        if (dist > aoRadius * 2.0f || dist < 1e-5f) continue;
-                        // signed height above the tangent plane, normalized
-                        float proj = glm::dot(diff, N) / dist;
-                        // occluder: neighbour well above the plane (concave
-                        // corner / object base), fading with distance
-                        float w = std::max(0.0f, proj - 0.15f) / 0.85f;
-                        w *= 1.0f - std::min(1.0f, dist / (aoRadius * 2.0f));
-                        occ += w;
-                        wsum += 1.0f;
-                    }
-                    if (wsum > 0.0f) occ /= wsum;
-                    ao[i] = 1.0f - aoStrength * std::min(1.0f, occ * 2.0f);
+                    tmp[row + size_t(x)] = acc / float(taps);
+                    const int add = std::min(width - 1, std::max(0, x + radius + 1));
+                    const int sub = std::min(width - 1, std::max(0, x - radius));
+                    acc += src[row + size_t(add)] - src[row + size_t(sub)];
                 }
-                for (int c = 2; c < 4; ++c)   // Id, Is = indirect diffuse/specular
-                    for (size_t i = 0; i < n; ++i)
-                        aovs[c][i].radiance *= ao[i];
-                // OIDN path: its composite replaces the AOV sum downstream,
-                // so apply the AO there too — weighted by the pixel's
-                // INDIRECT fraction (AO must not darken direct sunlight).
-                if (oidnColor.size() == n * 3) {
-                    for (size_t i = 0; i < n; ++i) {
-                        float idl = luminance(radiance_Id[i].radiance) +
-                                    luminance(radiance_Is[i].radiance);
-                        float tot = idl + luminance(radiance_Dd[i].radiance) +
-                                    luminance(radiance_Ds[i].radiance) +
-                                    (channels.emission ? luminance(float3(channels.emission[i])) : 0.0f);
-                        float frac = (tot > 1e-6f) ? std::min(1.0f, idl / tot) : 0.0f;
-                        float m = 1.0f - (1.0f - ao[i]) * frac;
-                        oidnColor[i*3+0] *= m;
-                        oidnColor[i*3+1] *= m;
-                        oidnColor[i*3+2] *= m;
-                    }
-                }
-                fprintf(stderr, "AO: position-based (radius=%.0fpx strength=%.2f taps=%d)\n",
-                        aoRadius, aoStrength, aoTaps);
-                fflush(stderr);
             }
-        }
-
-        // ---- Albedo high-frequency detail re-injection ----
-        // The multi-pass filter smooths low-contrast shading texture
-        // (weathering marks, grime) that the albedo-similarity gate cannot
-        // protect — it only stops ALBEDO EDGES. The first-hit albedo in the
-        // G-buffer is noise-free, so its high-frequency residual is pure
-        // texture: transfer it back onto the denoised radiance
-        // multiplicatively (per channel, hue-preserving). Linear in the four
-        // AOVs, so applying per-AOV equals applying to their sum.
-        // RENDER_DENOISE_DETAIL: gain (0 = off, default; 0.5-1.0 restores
-        // cobblestone/grain crispness measured at 0.30x of reference).
-        float detailGain = -1.0f;
-        if (const char* e = std::getenv("RENDER_DENOISE_DETAIL"))
-            detailGain = fmaxf(0.0f, std::strtof(e, nullptr));
-        if (detailGain > 0.0f && Gbuffer) {
-            // 3x3 box blur of the first-hit albedo (wrap-free edges)
-            std::vector<float3> alb(n);
-            for (size_t i = 0; i < n; ++i) alb[i] = Gbuffer[i].baseColor;
-            std::vector<float3> albBlur(n);
-            for (int y = 0; y < height; ++y)
             for (int x = 0; x < width; ++x) {
                 float3 acc(0.0f);
-                int cnt = 0;
-                for (int dy = -1; dy <= 1; ++dy)
-                for (int dx = -1; dx <= 1; ++dx) {
-                    int sx = std::min(width - 1, std::max(0, x + dx));
-                    int sy = std::min(height - 1, std::max(0, y + dy));
-                    acc += alb[size_t(sy) * width + sx];
-                    ++cnt;
+                for (int y = -radius; y <= radius; ++y) {
+                    const int sy = std::min(height - 1, std::max(0, y));
+                    acc += tmp[size_t(sy) * width + size_t(x)];
                 }
-                albBlur[size_t(y) * width + x] = acc / float(cnt);
+                for (int y = 0; y < height; ++y) {
+                    dst[size_t(y) * width + size_t(x)] = acc / float(taps);
+                    const int add = std::min(height - 1, std::max(0, y + radius + 1));
+                    const int sub = std::min(height - 1, std::max(0, y - radius));
+                    acc += tmp[size_t(add) * width + size_t(x)]
+                         - tmp[size_t(sub) * width + size_t(x)];
+                }
             }
-            RadianceData* aovs[4] = {radiance_Dd, radiance_Ds, radiance_Id, radiance_Is};
+        };
+        // Laplacian chain: cur starts at level-0 albedo; each step
+        // blurs it and transfers the band difference with a decaying
+        // weight. Radii 1,3,7 (then 15) cover the 2-8 px band.
+        std::vector<float3> cur(n), next(n);
+        cur = alb;
+        const int radii[4] = {1, 3, 7, 15};
+        RadianceData* aovs[4] = {radiance_Dd, radiance_Ds, radiance_Id, radiance_Is};
+        const bool haveOidn = oidnColor.size() == n * 3;
+        float weight = 1.0f;
+        for (int k = 0; k < detailScales; ++k) {
+            boxBlur(cur, next, radii[std::min(k, 3)]);
+            const float g = detailGain * weight;
             for (size_t i = 0; i < n; ++i) {
-                float3 hf = alb[i] - albBlur[i];
-                float3 fac = float3(1.0f + detailGain * hf.x,
-                                    1.0f + detailGain * hf.y,
-                                    1.0f + detailGain * hf.z);
-                fac = float3(fmaxf(fac.x, 0.0f), fmaxf(fac.y, 0.0f), fmaxf(fac.z, 0.0f));
+                // band detail, soft-clamped so albedo edges (already
+                // preserved by the filter) cannot double-apply into halos
+                auto band = [&](int c) {
+                    const float d = cur[i][c] - next[i][c];
+                    return fminf(fmaxf(d, -0.5f), 0.5f);
+                };
+                float3 fac = float3(1.0f + g * band(0),
+                                    1.0f + g * band(1),
+                                    1.0f + g * band(2));
+                fac = float3(fminf(fmaxf(fac.x, 0.1f), 3.0f),
+                             fminf(fmaxf(fac.y, 0.1f), 3.0f),
+                             fminf(fmaxf(fac.z, 0.1f), 3.0f));
                 for (int c = 0; c < 4; ++c)
                     aovs[c][i].radiance = aovs[c][i].radiance * fac;
+                if (haveOidn) {
+                    oidnColor[i*3+0] *= fac.x;
+                    oidnColor[i*3+1] *= fac.y;
+                    oidnColor[i*3+2] *= fac.z;
+                }
             }
+            cur.swap(next);   // next == blurred level becomes the next base
+            weight *= decay;
         }
-        // ---- SPP-adaptive energy gain (bias compensation) ----
-        // The calibrated 320spp look already includes the denoiser's own
-        // retention loss: log-domain averaging underestimates heavy-tailed
-        // data (Jensen) and the clamps remove energy, so the 320spp output
-        // keeps only ~77% of the raw MC mean (measured energyGain 1.227-
-        // 1.299 on the bistro interior). Targeting the raw MC mean would
-        // therefore brighten 320spp by ~25% versus the delivered
-        // calibration. The right target for a LOW-spp frame is "what this
-        // frame's 320spp output would have been": dnMean_320 ~ r320 x
-        // rawMean, where r320 (the 320spp retention) is a property of the
-        // scene's converged spikiness, not of the current spp.
-        //
-        // r320 (the 320spp retention) is a scene/pipeline constant:
-        // "how much of the raw MC mean the 320spp denoised output keeps"
-        // (measured 0.759 on the bistro interior DELIVERED pipeline, 480p:
-        // DENOISE log refGain=1.054 at r320=0.80 -> r = 0.80/1.054).
-        // Default 0.80 (within 6%); RENDER_DENOISE_RET320 overrides it per
-        // scene. Self-calibration (no domain pitfalls):
-        // render the scene at 320spp with RENDER_DENOISE_RET320=0.5 and
-        // read the DENOISE log — r320_true = 0.5 / printed refGain
-        // (refGain = r320_set / r320_true; it is logged even in the dead
-        // zone, where no gain is applied).
-        // An earlier per-frame auto-estimate from the denoised output's
-        // spikiness (S_dn) proved too noisy (+/-15-20%) and went fully
-        // out-of-distribution at 4spp (S_dn=256 -> r320=0.31, wrong by 2x),
-        // so it is kept only as a logged diagnostic.
-        //
-        // spp >= 320: gain is exactly 1.0 (dead zone) — the 320spp output
-        // stays bit-identical to the delivered pipeline (zero regression).
-        // The energy gain corrects the denoiser's energy retention — it must
-        // apply to WHICH EVER denoiser ran: NL-means multiplies the AOVs,
-        // OIDN multiplies oidnColor (otherwise the OIDN final frame reads
-        // ~2.7x darker than the calibrated NL-means+gain look, measured).
-        double dnLumSum = 0.0;
+    }
+}
+
+void Photo::applyEnergyGain(size_t n, double rawLumSum, float lumScale, float kSpp,
+                            bool nlMeans, int sppEff) {
+    RadianceData* aovs[4] = { radiance_Dd, radiance_Ds, radiance_Id, radiance_Is };
+    // ---- SPP-adaptive energy gain (bias compensation) ----
+    // The calibrated 320spp look already includes the denoiser's own
+    // retention loss: log-domain averaging underestimates heavy-tailed
+    // data (Jensen) and the clamps remove energy, so the 320spp output
+    // keeps only ~77% of the raw MC mean (measured energyGain 1.227-
+    // 1.299 on the bistro interior). Targeting the raw MC mean would
+    // therefore brighten 320spp by ~25% versus the delivered
+    // calibration. The right target for a LOW-spp frame is "what this
+    // frame's 320spp output would have been": dnMean_320 ~ r320 x
+    // rawMean, where r320 (the 320spp retention) is a property of the
+    // scene's converged spikiness, not of the current spp.
+    //
+    // r320 (the 320spp retention) is a scene/pipeline constant:
+    // "how much of the raw MC mean the 320spp denoised output keeps"
+    // (measured 0.759 on the bistro interior DELIVERED pipeline, 480p:
+    // DENOISE log refGain=1.054 at r320=0.80 -> r = 0.80/1.054).
+    // Default 0.80 (within 6%); RENDER_DENOISE_RET320 overrides it per
+    // scene. Self-calibration (no domain pitfalls):
+    // render the scene at 320spp with RENDER_DENOISE_RET320=0.5 and
+    // read the DENOISE log — r320_true = 0.5 / printed refGain
+    // (refGain = r320_set / r320_true; it is logged even in the dead
+    // zone, where no gain is applied).
+    // An earlier per-frame auto-estimate from the denoised output's
+    // spikiness (S_dn) proved too noisy (+/-15-20%) and went fully
+    // out-of-distribution at 4spp (S_dn=256 -> r320=0.31, wrong by 2x),
+    // so it is kept only as a logged diagnostic.
+    //
+    // spp >= 320: gain is exactly 1.0 (dead zone) — the 320spp output
+    // stays bit-identical to the delivered pipeline (zero regression).
+    // The energy gain corrects the denoiser's energy retention — it must
+    // apply to WHICH EVER denoiser ran: NL-means multiplies the AOVs,
+    // OIDN multiplies oidnColor (otherwise the OIDN final frame reads
+    // ~2.7x darker than the calibrated NL-means+gain look, measured).
+    double dnLumSum = 0.0;
+    if (nlMeans)
+    for (size_t i = 0; i < n; ++i)
+        dnLumSum += luminance(radiance_Dd[i].radiance) +
+                    luminance(radiance_Ds[i].radiance) +
+                    luminance(radiance_Id[i].radiance) +
+                    luminance(radiance_Is[i].radiance);
+    const size_t oidnElems = oidnColor.size() / 3;
+    if (!nlMeans && oidnElems == n)
+    for (size_t i = 0; i < n; ++i)
+        dnLumSum += luminance(float3(oidnColor[i*3+0], oidnColor[i*3+1],
+                                     oidnColor[i*3+2]));
+    float energyGain = 1.0f, refGain = 1.0f, r320 = 0.80f, Sdn = 0.0f;
+    if (dnLumSum > 1e-12) {
+        std::vector<float> dnLum;
+        dnLum.reserve(n / 4 + 1);
         if (nlMeans)
-        for (size_t i = 0; i < n; ++i)
-            dnLumSum += luminance(radiance_Dd[i].radiance) +
-                        luminance(radiance_Ds[i].radiance) +
-                        luminance(radiance_Id[i].radiance) +
-                        luminance(radiance_Is[i].radiance);
-        const size_t oidnElems = oidnColor.size() / 3;
-        if (!nlMeans && oidnElems == n)
-        for (size_t i = 0; i < n; ++i)
-            dnLumSum += luminance(float3(oidnColor[i*3+0], oidnColor[i*3+1],
-                                         oidnColor[i*3+2]));
-        float energyGain = 1.0f, refGain = 1.0f, r320 = 0.80f, Sdn = 0.0f;
-        if (dnLumSum > 1e-12) {
-            std::vector<float> dnLum;
-            dnLum.reserve(n / 4 + 1);
-            if (nlMeans)
-            for (size_t i = 0; i < n; i += 4)
-                dnLum.push_back(luminance(radiance_Dd[i].radiance) +
-                                luminance(radiance_Ds[i].radiance) +
-                                luminance(radiance_Id[i].radiance) +
-                                luminance(radiance_Is[i].radiance));
-            else
-            for (size_t i = 0; i < n; i += 4)
-                dnLum.push_back(luminance(float3(oidnColor[i*3+0],
-                                                 oidnColor[i*3+1],
-                                                 oidnColor[i*3+2])));
-            std::nth_element(dnLum.begin(), dnLum.begin() + dnLum.size() / 2, dnLum.end());
-            const double dnMean = dnLumSum / (double)n;
-            const double dnMedian = dnLum[dnLum.size() / 2];
-            Sdn = (float)(dnMean / fmax(dnMedian, 1e-9));   // diagnostic only
-            if (const char* e = std::getenv("RENDER_DENOISE_RET320")) {
-                double v = std::strtod(e, nullptr);
-                if (v > 0.0 && v < 1.0) r320 = (float)v;
-            }
-            refGain = (float)((r320 * rawLumSum) / dnLumSum);
-            refGain = std::min(3.0f, std::max(0.5f, refGain));
-            // Dead zone: at spp >= 320 the gain is NOT applied (zero
-            // regression), but refGain is logged for r320 calibration.
-            if (sppEff < (int)SPP_REF) energyGain = refGain;
+        for (size_t i = 0; i < n; i += 4)
+            dnLum.push_back(luminance(radiance_Dd[i].radiance) +
+                            luminance(radiance_Ds[i].radiance) +
+                            luminance(radiance_Id[i].radiance) +
+                            luminance(radiance_Is[i].radiance));
+        else
+        for (size_t i = 0; i < n; i += 4)
+            dnLum.push_back(luminance(float3(oidnColor[i*3+0],
+                                             oidnColor[i*3+1],
+                                             oidnColor[i*3+2])));
+        std::nth_element(dnLum.begin(), dnLum.begin() + dnLum.size() / 2, dnLum.end());
+        const double dnMean = dnLumSum / (double)n;
+        const double dnMedian = dnLum[dnLum.size() / 2];
+        Sdn = (float)(dnMean / fmax(dnMedian, 1e-9));   // diagnostic only
+        if (const char* e = std::getenv("RENDER_DENOISE_RET320")) {
+            double v = std::strtod(e, nullptr);
+            if (v > 0.0 && v < 1.0) r320 = (float)v;
         }
-        // The gain multiplies the filtered AOVs (NL-means) or oidnColor
-        // (OIDN) — the recomposite then picks the matching source.
-        if (nlMeans && (energyGain > 1.0001f || energyGain < 0.9999f))
-            for (int c = 0; c < 4; ++c)
-                for (size_t i = 0; i < n; ++i) {
-                    aovs[c][i].radiance *= energyGain;
-                    aovs[c][i].Var *= energyGain * energyGain;
-                }
-        if (!nlMeans && oidnElems == n &&
-            (energyGain > 1.0001f || energyGain < 0.9999f))
+        refGain = (float)((r320 * rawLumSum) / dnLumSum);
+        refGain = std::min(3.0f, std::max(0.5f, refGain));
+        // Dead zone: at spp >= 320 the gain is NOT applied (zero
+        // regression), but refGain is logged for r320 calibration.
+        if (sppEff < (int)SPP_REF) energyGain = refGain;
+    }
+    // The gain multiplies the filtered AOVs (NL-means) or oidnColor
+    // (OIDN) — the recomposite then picks the matching source.
+    if (nlMeans && (energyGain > 1.0001f || energyGain < 0.9999f))
+        for (int c = 0; c < 4; ++c)
             for (size_t i = 0; i < n; ++i) {
-                oidnColor[i*3+0] *= energyGain;
-                oidnColor[i*3+1] *= energyGain;
-                oidnColor[i*3+2] *= energyGain;
+                aovs[c][i].radiance *= energyGain;
+                aovs[c][i].Var *= energyGain * energyGain;
             }
-        fprintf(stderr, "DENOISE done (lumScale=%.4f spp=%d k=%.3f Sdn=%.2f r320=%.3f refGain=%.3f energyGain=%.3f)\n",
-                lumScale, sppEff, kSpp, Sdn, r320, refGain, energyGain); fflush(stderr);
-        denoised = true;
-    }
+    if (!nlMeans && oidnElems == n &&
+        (energyGain > 1.0001f || energyGain < 0.9999f))
+        for (size_t i = 0; i < n; ++i) {
+            oidnColor[i*3+0] *= energyGain;
+            oidnColor[i*3+1] *= energyGain;
+            oidnColor[i*3+2] *= energyGain;
+        }
+    fprintf(stderr, "DENOISE done (lumScale=%.4f spp=%d k=%.3f Sdn=%.2f r320=%.3f refGain=%.3f energyGain=%.3f)\n",
+            lumScale, sppEff, kSpp, Sdn, r320, refGain, energyGain); fflush(stderr);
+}
 
-    // Emission channel denoising (simple spatial blur, edge-aware via G-buffer)
-    if ((shadeOptions & DoDenoise) && channels.emission && Gbuffer) {
-        const size_t size = size_t(width) * height;
-        std::vector<float4> temp(size);
-        std::copy(channels.emission, channels.emission + size, temp.data());
-        const int rad = 2;
-        for (int y = 0; y < height; ++y) {
-            for (int x = 0; x < width; ++x) {
-                size_t idx = size_t(y) * width + x;
-                const HitInfo& Gp = Gbuffer[idx];
-                float4 sum(0.0f);
-                float totalW = 0.0f;
-                for (int dy = -rad; dy <= rad; ++dy) {
-                    for (int dx = -rad; dx <= rad; ++dx) {
-                        int sx = x + dx, sy = y + dy;
-                        if (sx < 0 || sx >= width || sy < 0 || sy >= height) continue;
-                        size_t sidx = size_t(sy) * width + sx;
-                        const HitInfo& Gq = Gbuffer[sidx];
-                        float dn = 1.0f - glm::dot(Gp.surfaceNormal, Gq.surfaceNormal);
-                        float w = expf(-dn * dn / 0.3f);
-                        float spatial = expf(-float(dx*dx + dy*dy) / 8.0f);
-                        sum += temp[sidx] * w * spatial;
-                        totalW += w * spatial;
-                    }
+// Emission channel denoising (simple spatial blur, edge-aware via G-buffer)
+void Photo::denoiseEmission() {
+    if (!channels.emission || !Gbuffer) return;
+    const size_t size = size_t(width) * height;
+    std::vector<float4> temp(size);
+    std::copy(channels.emission, channels.emission + size, temp.data());
+    const int rad = 2;
+    for (int y = 0; y < height; ++y) {
+        for (int x = 0; x < width; ++x) {
+            size_t idx = size_t(y) * width + x;
+            const HitInfo& Gp = Gbuffer[idx];
+            float4 sum(0.0f);
+            float totalW = 0.0f;
+            for (int dy = -rad; dy <= rad; ++dy) {
+                for (int dx = -rad; dx <= rad; ++dx) {
+                    int sx = x + dx, sy = y + dy;
+                    if (sx < 0 || sx >= width || sy < 0 || sy >= height) continue;
+                    size_t sidx = size_t(sy) * width + sx;
+                    const HitInfo& Gq = Gbuffer[sidx];
+                    float dn = 1.0f - glm::dot(Gp.surfaceNormal, Gq.surfaceNormal);
+                    float w = expf(-dn * dn / 0.3f);
+                    float spatial = expf(-float(dx*dx + dy*dy) / 8.0f);
+                    sum += temp[sidx] * w * spatial;
+                    totalW += w * spatial;
                 }
-                if (totalW > 1e-8f)
-                    channels.emission[idx] = sum / totalW;
             }
+            if (totalW > 1e-8f)
+                channels.emission[idx] = sum / totalW;
         }
     }
+}
 
-    // Recomposite final color from the (denoised) AOVs — without this the
-    // filtered radiance arrays were computed but never used, so denoising
-    // had no effect on the output image.
-    if (denoised) {
-        const size_t size = size_t(width) * height;
-        const bool useOidn = oidnColor.size() == size * 3;
-        for (size_t i = 0; i < size; ++i) {
-            float3 c;
-            if (useOidn) {
-                c = float3(oidnColor[i*3+0], oidnColor[i*3+1], oidnColor[i*3+2]);
-            } else {
-                c = radiance_Dd[i].radiance + radiance_Ds[i].radiance
-                  + radiance_Id[i].radiance + radiance_Is[i].radiance;
-                c += float3(channels.emission[i]);
-            }
-            channels.finalColor[i] = float4(c, 1.0f);
+// Recomposite final color from the (denoised) AOVs — without this the
+// filtered radiance arrays were computed but never used, so denoising had
+// no effect on the output image. Called only when denoiseRadiance ran.
+void Photo::recompositeFinal() {
+    const size_t size = size_t(width) * height;
+    const bool useOidn = oidnColor.size() == size * 3;
+    for (size_t i = 0; i < size; ++i) {
+        float3 c;
+        if (useOidn) {
+            c = float3(oidnColor[i*3+0], oidnColor[i*3+1], oidnColor[i*3+2]);
+        } else {
+            c = radiance_Dd[i].radiance + radiance_Ds[i].radiance
+              + radiance_Id[i].radiance + radiance_Is[i].radiance;
+            c += float3(channels.emission[i]);
         }
+        channels.finalColor[i] = float4(c, 1.0f);
     }
+}
 
+void Photo::finishDisplay(int shadeOptions) {
     // Reference pipeline order: exposure-scaled HDR → HDR-domain bloom →
     // soft-clip + gamma. Bloom must run BEFORE gamma so the Clum≥1 threshold
     // selects true light sources in linear units.

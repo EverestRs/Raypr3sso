@@ -102,7 +102,19 @@ int uploadTexturesToGPU(const int* texWidths, const int* texHeights,
                         int numTextures,
                         unsigned long long** outTexObjects,
                         int** outTexWidths, int** outTexHeights,
-                        unsigned char** outRawData) {
+                        unsigned char** outRawData,
+                        const int* mipLevelCounts,
+                        const int* mipLevelStart,
+                        const long long* mipTexByteOffsets,
+                        const unsigned char* const* mipLevelPointers,
+                        const int* mipLevelWidths,
+                        const int* mipLevelHeights,
+                        unsigned char** outMipRawData,
+                        long long** outMipByteOffsets,
+                        int** outMipLevels,
+                        int** outMipWidths,
+                        int** outMipHeights,
+                        int** outMipStart) {
     *outTexObjects = nullptr;  // deprecated: cudaTextureObjects are not used
                                // by the kernel (manual bilinear on texData)
     if (numTextures == 0) {
@@ -187,6 +199,87 @@ int uploadTexturesToGPU(const int* texWidths, const int* texHeights,
     *outTexWidths  = gpuWidths;
     *outTexHeights = gpuHeights;
     *outRawData = gpuRaw;
+
+    // ---- P0 mipmap chain upload ----
+    if (outMipRawData) *outMipRawData = nullptr;
+    if (outMipByteOffsets) *outMipByteOffsets = nullptr;
+    if (outMipLevels) *outMipLevels = nullptr;
+    if (outMipWidths) *outMipWidths = nullptr;
+    if (outMipHeights) *outMipHeights = nullptr;
+    if (outMipStart) *outMipStart = nullptr;
+    if (mipLevelCounts && mipLevelStart && mipTexByteOffsets &&
+        mipLevelPointers && mipLevelWidths && mipLevelHeights && outMipRawData) {
+        const long long mipTotal = mipTexByteOffsets[numTextures];
+        if (mipTotal > 0) {
+            unsigned char* gpuMip = nullptr;
+            cudaError_t me = cudaMalloc(&gpuMip, size_t(mipTotal));
+            if (me == cudaSuccess) {
+                bool ok = true;
+                for (int i = 0; i < numTextures && ok; ++i) {
+                    const int start = mipLevelStart[i];
+                    const int cnt = mipLevelCounts[i];
+                    long long dst = mipTexByteOffsets[i];
+                    for (int l = 0; l < cnt; ++l) {
+                        const int idx = start + l;
+                        const size_t bytes = size_t(mipLevelWidths[idx]) *
+                                             mipLevelHeights[idx] * 4;
+                        if (!mipLevelPointers[idx] || bytes == 0) { ok = false; break; }
+                        const cudaError_t e = cudaMemcpy(gpuMip + dst,
+                                                         mipLevelPointers[idx],
+                                                         bytes, cudaMemcpyHostToDevice);
+                        if (e != cudaSuccess) {
+                            fprintf(stderr, "!! mip upload FAILED tex %d lvl %d: %s\n",
+                                    i, l + 1, cudaGetErrorString(e));
+                            ok = false; break;
+                        }
+                        dst += bytes;
+                    }
+                }
+                if (ok) {
+                    *outMipRawData = gpuMip;
+                    // metadata arrays
+                    long long* hOff = new long long[numTextures + 1];
+                    for (int i = 0; i <= numTextures; ++i) hOff[i] = mipTexByteOffsets[i];
+                    long long* gpuOff = nullptr;
+                    cudaMalloc(&gpuOff, (numTextures + 1) * sizeof(long long));
+                    cudaMemcpy(gpuOff, hOff, (numTextures + 1) * sizeof(long long),
+                               cudaMemcpyHostToDevice);
+                    delete[] hOff;
+                    if (outMipByteOffsets) *outMipByteOffsets = gpuOff;
+                    int* gpuLv = nullptr;
+                    cudaMalloc(&gpuLv, numTextures * sizeof(int));
+                    cudaMemcpy(gpuLv, mipLevelCounts, numTextures * sizeof(int),
+                               cudaMemcpyHostToDevice);
+                    if (outMipLevels) *outMipLevels = gpuLv;
+                    int* gpuSt = nullptr;
+                    cudaMalloc(&gpuSt, (numTextures + 1) * sizeof(int));
+                    cudaMemcpy(gpuSt, mipLevelStart, (numTextures + 1) * sizeof(int),
+                               cudaMemcpyHostToDevice);
+                    if (outMipStart) *outMipStart = gpuSt;
+                    const int totalLevels = mipLevelStart[numTextures];
+                    if (totalLevels > 0) {
+                        int* gpuW = nullptr; int* gpuH = nullptr;
+                        cudaMalloc(&gpuW, totalLevels * sizeof(int));
+                        cudaMalloc(&gpuH, totalLevels * sizeof(int));
+                        cudaMemcpy(gpuW, mipLevelWidths, totalLevels * sizeof(int),
+                                   cudaMemcpyHostToDevice);
+                        cudaMemcpy(gpuH, mipLevelHeights, totalLevels * sizeof(int),
+                                   cudaMemcpyHostToDevice);
+                        if (outMipWidths) *outMipWidths = gpuW;
+                        if (outMipHeights) *outMipHeights = gpuH;
+                    }
+                    fprintf(stderr, "  Mip VRAM: %.2f GB (%d levels)\n",
+                            double(mipTotal) / 1e9, totalLevels);
+                } else {
+                    cudaFree(gpuMip);
+                    fprintf(stderr, "!! mipmap upload incomplete — falling back to level 0 only\n");
+                }
+            } else {
+                fprintf(stderr, "!! MIP cudaMalloc(%lld MB) failed: %s — level 0 only\n",
+                        mipTotal / (1024 * 1024), cudaGetErrorString(me));
+            }
+        }
+    }
     return success;
 }
 
@@ -224,8 +317,10 @@ extern "C" void freeGPUCDF(float* gpuCDF) {
     if (gpuCDF) cudaFree(gpuCDF);
 }
 
-void freeGPUTextureBuffers(unsigned char* texData, int* texWidths, int* texHeights) {
+void freeGPUTextureBuffers(unsigned char* texData, int* texWidths, int* texHeights,
+                           unsigned char* mipData) {
     if (texData)    { cudaError_t e = cudaFree(texData);    if (e != cudaSuccess) fprintf(stderr, "  free texData FAILED: %s\n", cudaGetErrorString(e)); }
     if (texWidths)  { cudaFree(texWidths); }
     if (texHeights) { cudaFree(texHeights); }
+    if (mipData)    { cudaError_t e = cudaFree(mipData);    if (e != cudaSuccess) fprintf(stderr, "  free mipData FAILED: %s\n", cudaGetErrorString(e)); }
 }

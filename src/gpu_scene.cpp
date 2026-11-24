@@ -104,6 +104,12 @@ GPUScene::GeometryData GPUScene::packGeometry(const Model& model) {
 	gpuMaterials.texDataHeights = textureUpload.heights;
 	gpuMaterials.texFormats = textureUpload.formats.data();
 	gpuMaterials.texByteOffsets = textureUpload.byteOffsets.data();
+	gpuMaterials.mipData = textureUpload.mipRawData;
+	gpuMaterials.mipByteOffsets = textureUpload.mipByteOffsetsGpu;
+	gpuMaterials.mipLevels = textureUpload.mipLevelsGpu;
+	gpuMaterials.mipWidths = textureUpload.mipWidthsGpu;
+	gpuMaterials.mipHeights = textureUpload.mipHeightsGpu;
+	gpuMaterials.mipLevelStart = textureUpload.mipStartGpu;
 
 	LinearBVHNode* flatBvh = flattenBVH(model);
 	fprintf(stderr, "  load-stage: uploadModel\n");
@@ -117,6 +123,7 @@ GPUScene::GeometryData GPUScene::packGeometry(const Model& model) {
 	scene->attach(UploadedResources{
 		gpuModel, textureUpload.objects, textureUpload.uploaded,
 		textureUpload.rawData, textureUpload.widths, textureUpload.heights,
+		textureUpload.mipRawData,
 		sky.texture, sky.cdf, sky.cdfSum, sky.width, sky.height});
 	return scene;
 }
@@ -152,6 +159,31 @@ GPUScene::TextureData GPUScene::collectTextures(const Model& model) {
 		registerTexture(material.roughnessMap);
 		registerTexture(material.metallicMap);
 		registerTexture(material.emissionMap);
+	}
+	// P0: mip chains must be built in each texture's DECODE domain:
+	//   baseColor -> pow 2.2 (shader gpu_toLinear)
+	//   emission  -> pow(emissionGamma): 5.0 default, 2.2 for string lights
+	//                (the shader raises the sampled texel to emG directly)
+	//   normal/roughness/metallic -> linear bytes (unchanged; not decoded)
+	// Averaging in the wrong domain bias-darkens every mip (Jensen), which
+	// measured as a 9% interior luma drop before this existed.
+	{
+		std::unordered_map<ImageTexture*, float> gammaUse;
+		for (const auto& material : materials) {
+			if (material.baseColorMap) gammaUse.emplace(material.baseColorMap, 2.2f);
+			if (material.emissionMap) {
+				std::string lower = material.name;
+				for (auto& ch : lower)
+					ch = char(std::tolower(static_cast<unsigned char>(ch)));
+				const float g = lower.find("stringlight") != std::string::npos ? 2.2f : 5.0f;
+				auto it = gammaUse.find(material.emissionMap);
+				if (it == gammaUse.end() || it->second < g) gammaUse[material.emissionMap] = g;
+			}
+		}
+		for (auto* tex : result.unique) {
+			auto it = gammaUse.find(tex);
+			if (tex && it != gammaUse.end()) tex->rebuildMipmapsSrgb(it->second);
+		}
 	}
 	return result;
 }
@@ -467,15 +499,60 @@ GPUScene::TextureUploadData GPUScene::uploadTextures(const TextureData& textures
 		texelCursor += textures.widths[i] * textures.heights[i];
 	}
 	result.texelOffsets[count] = texelCursor;
-	fprintf(stderr, "  Texture storage: %d BC-compressed + %d RGBA8 (%.2f GB GPU layout)\n",
-			bcCount, rgbaCount, double(byteCursor) / 1e9);
+
+	// ---- P0 mipmap chain staging ----
+	// Levels 1..N (RGBA8, built by generateMipmaps at load) are uploaded to a
+	// SEPARATE GPU buffer so the level-0 layout (byteOffsets/texelOffsets)
+	// stays bit-identical. Textures with channels != 4 (e.g. HDR-loaded 3ch)
+	// are skipped: the kernel's RGBA8 mip fetch assumes 4 bytes/texel.
+	// Levels are separate allocations (not contiguous) → flat per-level
+	// pointer/size arrays + per-texture [start,count] + per-texture GPU byte
+	// offsets are all the kernel needs.
+	result.mipLevelCounts.assign(count, 0);
+	result.mipLevelStart.assign(count + 1, 0);
+	std::vector<long long> mipTexByteOffsets(count + 1, 0);
+	long long mipCursor = 0;
+	int levelIdx = 0;
+	for (size_t i = 0; i < count; ++i) {
+		result.mipLevelStart[i] = levelIdx;
+		mipTexByteOffsets[i] = mipCursor;
+		const ImageTexture* tex = textures.unique[i];
+		if (!tex || tex->getChannels() != 4) continue;
+		const int levels = tex->getMipLevels();
+		int stored = 0;
+		for (int l = 1; l <= levels; ++l) {
+			const int mw = tex->getMipWidth(l), mh = tex->getMipHeight(l);
+			if (mw <= 0 || mh <= 0 || !tex->getMipData(l)) continue;
+			result.mipLevelPointers.push_back(tex->getMipData(l));
+			result.mipLevelWidths.push_back(mw);
+			result.mipLevelHeights.push_back(mh);
+			mipCursor += (long long)mw * mh * 4;
+			++levelIdx; ++stored;
+		}
+		result.mipLevelCounts[i] = stored;
+	}
+	result.mipLevelStart[count] = levelIdx;
+	mipTexByteOffsets[count] = mipCursor;
+	result.mipTexByteOffsets = mipTexByteOffsets;
+	fprintf(stderr, "  Texture storage: %d BC-compressed + %d RGBA8 (%.2f GB GPU layout), "
+			"%d mip levels staged (%.2f GB)\n",
+			bcCount, rgbaCount, double(byteCursor) / 1e9, levelIdx,
+			double(mipCursor) / 1e9);
 
 	if (count > 0) {
 		result.uploaded = uploadTexturesToGPU(
 			textures.widths.data(), textures.heights.data(), textures.channels.data(),
 			textures.data.data(), result.formats.data(), result.blocks.data(),
 			result.byteOffsets.data(), int(count), &result.objects, &result.widths,
-			&result.heights, &result.rawData);
+			&result.heights, &result.rawData,
+			result.mipLevelCounts.empty() ? nullptr : result.mipLevelCounts.data(),
+			result.mipLevelStart.empty() ? nullptr : result.mipLevelStart.data(),
+			result.mipTexByteOffsets.empty() ? nullptr : result.mipTexByteOffsets.data(),
+			result.mipLevelPointers.empty() ? nullptr : result.mipLevelPointers.data(),
+			result.mipLevelWidths.empty() ? nullptr : result.mipLevelWidths.data(),
+			result.mipLevelHeights.empty() ? nullptr : result.mipLevelHeights.data(),
+			&result.mipRawData, &result.mipByteOffsetsGpu, &result.mipLevelsGpu,
+			&result.mipWidthsGpu, &result.mipHeightsGpu, &result.mipStartGpu);
 		if (result.uploaded < int(count))
 			fprintf(stderr, "!! WARNING: only %d/%zu textures uploaded to GPU\n",
 					result.uploaded, count);

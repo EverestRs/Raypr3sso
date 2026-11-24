@@ -528,6 +528,21 @@ void renderGPUWavefrontCancelable(GPURenderArgs args, GPUModelData model,
     sanitizeAdaptiveArgs(args);
     const bool adaptive = args.adaptiveMin > 1;
 
+    // P0 diagnostics: LOD distribution probe (RENDER_MIP_PROBE=texId).
+    // Zeroed here so every chunk of a progressive chain accumulates the
+    // global max; printed at the end of the render.
+    float* probeU = nullptr; float* probeV = nullptr;
+    const char* probeEnv = std::getenv("RENDER_MIP_PROBE");
+    const bool probing = probeEnv && args.useMipmaps;
+    if (probing) {
+        cudaMalloc(&probeU, sizeof(float)); cudaMalloc(&probeV, sizeof(float));
+        cudaMemset(probeU, 0, sizeof(float)); cudaMemset(probeV, 0, sizeof(float));
+        model.materials.mipProbe = 1;
+        model.materials.mipProbeTexId = std::atoi(probeEnv);
+        model.materials.mipProbeMaxU = probeU;
+        model.materials.mipProbeMaxV = probeV;
+    }
+
     // Progressive accumulation: this call folds absolute samples
     // [startSample, startSample + args.spp) into the caller-owned
     // accumulators. Seeds and jitter sequences are pure functions of the
@@ -773,4 +788,14 @@ void renderGPUWavefrontCancelable(GPURenderArgs args, GPUModelData model,
     // reused by the next render at the same or smaller resolution (批1: the
     // progress/pinned/stream infrastructure too — no per-call teardown).
     fprintf(stderr, "renderGPUWavefront: done\n"); fflush(stderr);
+    if (probing) {
+        float hu = 0, hv = 0;
+        cudaMemcpy(&hu, probeU, sizeof(float), cudaMemcpyDeviceToHost);
+        cudaMemcpy(&hv, probeV, sizeof(float), cudaMemcpyDeviceToHost);
+        fprintf(stderr, "MIPPROBE tex %d: max rU=%.1f rV=%.1f texels (%.1f/%.1f mip levels)\n",
+                model.materials.mipProbeTexId, hu, hv,
+                log2f(fmaxf(hu, 1.f)), log2f(fmaxf(hv, 1.f)));
+        fflush(stderr);
+        cudaFree(probeU); cudaFree(probeV);
+    }
 }

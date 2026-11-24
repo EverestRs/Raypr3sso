@@ -6,6 +6,7 @@ project(Raypr3sso
 )
 
 find_package(Threads REQUIRED)
+find_package(CUDAToolkit REQUIRED)
 
 # ---- C++ Standard ----
 set(CMAKE_CXX_STANDARD 17)
@@ -20,6 +21,24 @@ option(RENDERER_USE_TINYEXR "Enable OpenEXR output via tinyexr" OFF)
 # the byte-level A/B regression standard (ulp-level FP differences everywhere);
 # keep OFF for verification builds, enable for throughput experiments.
 option(RENDERER_FAST_MATH "Enable --use_fast_math for CUDA kernels (breaks byte-level reproducibility)" OFF)
+# Warnings: on by default but never fatal — the codebase predates them and CI
+# only needs to surface new ones. Flip RENDERER_WERROR on for a clean branch.
+option(RENDERER_WARNINGS "Enable -Wall -Wextra for host/CUDA host code" ON)
+option(RENDERER_WERROR "Treat warnings as errors" OFF)
+
+function(raypr3sso_enable_warnings target)
+    if(RENDERER_WARNINGS)
+        target_compile_options(${target} PRIVATE
+            $<$<COMPILE_LANGUAGE:CXX>:-Wall>
+            $<$<COMPILE_LANGUAGE:CXX>:-Wextra>
+            $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=-Wall,-Wextra>)
+    endif()
+    if(RENDERER_WERROR)
+        target_compile_options(${target} PRIVATE
+            $<$<COMPILE_LANGUAGE:CXX>:-Werror>
+            $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=-Werror>)
+    endif()
+endfunction()
 
 # ---- CUDA Architecture ----
 # Target GPU: NVIDIA Tesla V100 (sm_70, Volta).
@@ -47,7 +66,7 @@ set(EXTERNAL_DIR "${CMAKE_SOURCE_DIR}/external")
 if(EXISTS "${EXTERNAL_DIR}/glm/glm/glm.hpp")
     message(STATUS "Using local glm from ${EXTERNAL_DIR}/glm")
     add_library(glm INTERFACE)
-    target_include_directories(glm INTERFACE "${EXTERNAL_DIR}/glm")
+    target_include_directories(glm SYSTEM INTERFACE "${EXTERNAL_DIR}/glm")
 else()
     message(STATUS "glm not found locally, fetching via FetchContent")
     include(FetchContent)
@@ -63,7 +82,7 @@ endif()
 if(EXISTS "${EXTERNAL_DIR}/stb/stb_image.h")
     message(STATUS "Using local stb from ${EXTERNAL_DIR}/stb")
     add_library(stb INTERFACE)
-    target_include_directories(stb INTERFACE "${EXTERNAL_DIR}/stb")
+    target_include_directories(stb SYSTEM INTERFACE "${EXTERNAL_DIR}/stb")
 else()
     message(STATUS "stb not found locally, fetching via FetchContent")
     include(FetchContent)
@@ -74,7 +93,7 @@ else()
     )
     FetchContent_MakeAvailable(stb)
     add_library(stb INTERFACE)
-    target_include_directories(stb INTERFACE "${stb_SOURCE_DIR}")
+    target_include_directories(stb SYSTEM INTERFACE "${stb_SOURCE_DIR}")
 endif()
 
 # assimp (optional, for FBX/glTF model loading)
@@ -103,15 +122,17 @@ if(RENDERER_USE_TINYEXR)
     if(EXISTS "${EXTERNAL_DIR}/tinyexr/tinyexr.h")
         message(STATUS "Using local tinyexr from ${EXTERNAL_DIR}/tinyexr")
         add_library(tinyexr INTERFACE)
-        target_include_directories(tinyexr INTERFACE "${EXTERNAL_DIR}/tinyexr")
+        target_include_directories(tinyexr SYSTEM INTERFACE "${EXTERNAL_DIR}/tinyexr")
     else()
         message(STATUS "tinyexr not found locally")
     endif()
 endif()
 
-# ---- Source Files ----
-set(SOURCES
-    src/main.cpp
+# ---- Core library (shared by the CLI and the render server) ----
+# Both executables used to list the same engine sources; adding a file meant
+# editing two lists. The core static library owns the engine, the executables
+# are thin entry points.
+set(CORE_SOURCES
     src/geometry.cpp
     src/component.cpp
     src/material.cpp
@@ -126,100 +147,83 @@ set(SOURCES
     src/gpu_utils.cpp
     src/gpu_scene.cpp
     src/render_job.cpp
+    src/http_util.cpp
+    src/render_server.cpp
 )
 
-set(CUDA_SOURCES
-    # bvh_gpu.cu is #included from render_gpu.cu to avoid linker stripping PTX
-    src/render_gpu.cu
+set(CORE_CUDA_SOURCES
+    # One explicit CUDA TU. cuda_tu.cu implementation-includes bvh_gpu.cu,
+    # render_gpu.cu and render_wavefront.cu (separable compilation is off —
+    # see the linker note below). This is the ONLY file that may #include a
+    # .cu implementation.
+    src/cuda_tu.cu
     # GPU post-processing pipeline (RENDER_POST_GPU=1) — mirrors image.cpp
     src/image_gpu.cu
 )
 
-# ---- Main Executable ----
-add_executable(Raypr3sso ${SOURCES} ${CUDA_SOURCES})
+add_library(render_core STATIC ${CORE_SOURCES} ${CORE_CUDA_SOURCES})
 
-add_executable(render_server
-    src/render_server_main.cpp
-    src/render_server.cpp
-    src/render_job.cpp
-    src/model.cpp
-    src/geometry.cpp
-    src/component.cpp
-    src/material.cpp
-    src/bvh.cpp
-    src/sampling.cpp
-    src/camera.cpp
-    src/utils.cpp
-    src/gpu_utils.cpp
-    src/gpu_scene.cpp
-    src/image.cpp
-    src/image_gpu.cu
-    src/render.cpp
-    src/render_gpu.cu
-)
-target_include_directories(render_server PRIVATE
+target_include_directories(render_core PUBLIC
     ${CMAKE_SOURCE_DIR}/src
     ${CMAKE_SOURCE_DIR}/include
 )
-target_compile_definitions(render_server PRIVATE RENDERER_HAS_CUDA)
-target_link_libraries(render_server PRIVATE Threads::Threads glm stb)
-if(assimp_FOUND)
-    target_link_libraries(render_server PRIVATE assimp::assimp)
-endif()
-if(OIDN_DIRS)
-    target_include_directories(render_server PRIVATE "${OIDN_INCLUDE_DIR}")
-    target_link_libraries(render_server PRIVATE "${OIDN_LIB}")
-    set_target_properties(render_server PROPERTIES BUILD_RPATH "${OIDN_DIR}/lib")
-endif()
-# Disable separable compilation: the device linker strips PTX, but V100
-# needs PTX (sm_70 is not supported by CUDA 13.0's SASS compiler).
-# Instead, bvh_gpu.cu is #included from render_gpu.cu to avoid cross-file
-# device function calls.
-# set_property(TARGET Raypr3sso PROPERTY CUDA_SEPARABLE_COMPILATION ON)
-
-target_include_directories(Raypr3sso PRIVATE
-    ${CMAKE_SOURCE_DIR}/src
-    ${CMAKE_SOURCE_DIR}/include
-)
-
-target_link_libraries(Raypr3sso PRIVATE
+target_compile_definitions(render_core PUBLIC RENDERER_HAS_CUDA)
+target_link_libraries(render_core PUBLIC
     glm
     stb
     Threads::Threads
+    CUDA::cudart
 )
 if(assimp_FOUND)
-    target_link_libraries(Raypr3sso PRIVATE assimp::assimp)
+    target_link_libraries(render_core PUBLIC assimp::assimp)
+endif()
+if(OIDN_DIRS)
+    target_include_directories(render_core SYSTEM PUBLIC "${OIDN_INCLUDE_DIR}")
+    target_link_libraries(render_core PUBLIC "${OIDN_LIB}")
+endif()
+if(RENDERER_USE_TINYEXR)
+    target_link_libraries(render_core PUBLIC tinyexr)
+    target_compile_definitions(render_core PUBLIC RENDERER_HAS_TINYEXR)
 endif()
 
+# Disable separable compilation: the device linker strips PTX, but V100
+# needs PTX (sm_70 is not supported by CUDA 13.0's SASS compiler).
+# Consequence: every cross-file device call lives in ONE translation unit,
+# src/cuda_tu.cu.
+# set_property(TARGET render_core PROPERTY CUDA_SEPARABLE_COMPILATION ON)
+
+# ---- Executables (thin entry points) ----
+add_executable(Raypr3sso src/main.cpp)
+target_link_libraries(Raypr3sso PRIVATE render_core)
+
+add_executable(render_server src/render_server_main.cpp)
+target_link_libraries(render_server PRIVATE render_core)
+
 if(OIDN_DIRS)
-    target_include_directories(Raypr3sso PRIVATE "${OIDN_INCLUDE_DIR}")
-    target_link_libraries(Raypr3sso PRIVATE "${OIDN_LIB}")
     set_target_properties(Raypr3sso PROPERTIES
         BUILD_RPATH "${OIDN_DIR}/lib"
         INSTALL_RPATH "${OIDN_DIR}/lib")
-endif()
-
-if(RENDERER_USE_TINYEXR)
-    target_link_libraries(Raypr3sso PRIVATE tinyexr)
-    target_compile_definitions(Raypr3sso PRIVATE RENDERER_HAS_TINYEXR)
+    set_target_properties(render_server PROPERTIES BUILD_RPATH "${OIDN_DIR}/lib")
 endif()
 
 # ---- CUDA specific flags ----
-target_compile_options(Raypr3sso PRIVATE
+target_compile_options(render_core PRIVATE
     $<$<COMPILE_LANGUAGE:CUDA>:--extra-device-vectorization>
     $<$<COMPILE_LANGUAGE:CUDA>:-lineinfo>
 )
 if(RENDERER_FAST_MATH)
-    target_compile_options(Raypr3sso PRIVATE
-        $<$<COMPILE_LANGUAGE:CUDA>:--use_fast_math>)
-    target_compile_options(render_server PRIVATE
+    target_compile_options(render_core PRIVATE
         $<$<COMPILE_LANGUAGE:CUDA>:--use_fast_math>)
 endif()
 
 # ---- Platform specific ----
 if(WIN32)
-    target_compile_definitions(Raypr3sso PRIVATE _USE_MATH_DEFINES)
+    target_compile_definitions(render_core PUBLIC _USE_MATH_DEFINES)
 endif()
+
+raypr3sso_enable_warnings(render_core)
+raypr3sso_enable_warnings(Raypr3sso)
+raypr3sso_enable_warnings(render_server)
 
 # ---- Install ----
 install(TARGETS Raypr3sso DESTINATION bin)
@@ -229,4 +233,5 @@ message(STATUS "Raypr3sso Configuration:")
 message(STATUS "  CUDA Architecture : ${CUDA_ARCH}")
 message(STATUS "  tinyexr support   : ${RENDERER_USE_TINYEXR}")
 message(STATUS "  fast_math         : ${RENDERER_FAST_MATH}")
+message(STATUS "  warnings          : ${RENDERER_WARNINGS} (Werror: ${RENDERER_WERROR})")
 message(STATUS "  Build type        : ${CMAKE_BUILD_TYPE}")

@@ -69,6 +69,21 @@ public:
         int* heights = nullptr;
         unsigned char* rawData = nullptr;
         int uploaded = 0;
+        // P0 mipmap chain (levels 1..N, RGBA8) — mirrors GPUMaterialBuffer
+        // mip fields. Host staging vectors are filled by uploadTextures;
+        // the GPU pointers are returned by uploadTexturesToGPU.
+        std::vector<const unsigned char*> mipLevelPointers;  // host, flat per-level
+        std::vector<int> mipLevelCounts;                // per texture
+        std::vector<int> mipLevelWidths;                // flat per-level
+        std::vector<int> mipLevelHeights;               // flat per-level
+        std::vector<int> mipLevelStart;                 // [numTextures+1]
+        std::vector<long long> mipTexByteOffsets;       // [numTextures+1]
+        unsigned char* mipRawData = nullptr;            // GPU
+        long long* mipByteOffsetsGpu = nullptr;         // GPU [numTextures+1]
+        int* mipLevelsGpu = nullptr;                    // GPU [numTextures]
+        int* mipWidthsGpu = nullptr;                    // GPU flat
+        int* mipHeightsGpu = nullptr;                   // GPU flat
+        int* mipStartGpu = nullptr;                     // GPU [numTextures+1]
     };
 
     static TextureUploadData uploadTextures(const TextureData& textures);
@@ -98,12 +113,13 @@ public:
                                     int numObjects);
 
     struct UploadedResources {
-        GPUModelData model{};
+        GPUModelData model;
         unsigned long long* textureObjects = nullptr;
         int textureCount = 0;
         unsigned char* textureData = nullptr;
         int* textureWidths = nullptr;
         int* textureHeights = nullptr;
+        unsigned char* mipData = nullptr;   // P0 mipmap chain buffer
         cudaTextureObject_t skyTexture = 0;
         float* skyCDF = nullptr;
         float skyCDFSum = 0.0f;
@@ -136,6 +152,7 @@ public:
         textureData_ = resources.textureData;
         textureWidths_ = resources.textureWidths;
         textureHeights_ = resources.textureHeights;
+        mipData_ = resources.mipData;
         skyTexture_ = resources.skyTexture;
         skyCDF_ = resources.skyCDF;
         skyCDFSum_ = resources.skyCDFSum;
@@ -156,7 +173,7 @@ public:
         freeGPUModel(model_);
         if (textureObjects_)
             freeGPUTextures(textureObjects_, textureCount_);
-        freeGPUTextureBuffers(textureData_, textureWidths_, textureHeights_);
+        freeGPUTextureBuffers(textureData_, textureWidths_, textureHeights_, mipData_);
         if (skyTexture_)
             freeSkyBoxTexture(skyTexture_);
         if (skyCDF_)
@@ -166,6 +183,7 @@ public:
         textureData_ = nullptr;
         textureWidths_ = nullptr;
         textureHeights_ = nullptr;
+        mipData_ = nullptr;
         skyTexture_ = 0;
         skyCDF_ = nullptr;
         skyCDFSum_ = 0.0f;
@@ -181,6 +199,7 @@ private:
         textureData_ = other.textureData_;
         textureWidths_ = other.textureWidths_;
         textureHeights_ = other.textureHeights_;
+        mipData_ = other.mipData_;
         skyTexture_ = other.skyTexture_;
         skyCDF_ = other.skyCDF_;
         other.model_ = {};
@@ -189,6 +208,7 @@ private:
         other.textureData_ = nullptr;
         other.textureWidths_ = nullptr;
         other.textureHeights_ = nullptr;
+        other.mipData_ = nullptr;
         other.skyTexture_ = 0;
         other.skyCDF_ = nullptr;
         skyCDFSum_ = other.skyCDFSum_;
@@ -205,6 +225,7 @@ private:
     unsigned char* textureData_ = nullptr;
     int* textureWidths_ = nullptr;
     int* textureHeights_ = nullptr;
+    unsigned char* mipData_ = nullptr;   // P0 mipmap chain GPU buffer
     cudaTextureObject_t skyTexture_ = 0;
     float* skyCDF_ = nullptr;
     float skyCDFSum_ = 0.0f;

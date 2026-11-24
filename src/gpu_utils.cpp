@@ -97,6 +97,14 @@ GPUModelData uploadModelToGPU(const float3* verts, int numVerts,
     upMat(data.materials.texDataOffsets,    matBuf.texDataOffsets,    (matBuf.numTextures + 1) * sizeof(int), "toff");
     upMat(data.materials.texFormats,        matBuf.texFormats,        matBuf.numTextures * sizeof(int), "tfmt");
     upMat(data.materials.texByteOffsets,    matBuf.texByteOffsets,    (matBuf.numTextures + 1) * sizeof(long long), "tboff");
+    // P0 mipmap chain: already device pointers from uploadTexturesToGPU —
+    // pass through (no re-upload).
+    data.materials.mipData        = matBuf.mipData;
+    data.materials.mipByteOffsets = matBuf.mipByteOffsets;
+    data.materials.mipLevels      = matBuf.mipLevels;
+    data.materials.mipWidths      = matBuf.mipWidths;
+    data.materials.mipHeights     = matBuf.mipHeights;
+    data.materials.mipLevelStart  = matBuf.mipLevelStart;
     upMat(data.materials.alphaCutout,       matBuf.alphaCutout,       matBuf.numMaterials * sizeof(int), "aco");
     upMat(data.materials.uvFlipU,           matBuf.uvFlipU,           matBuf.numMaterials * sizeof(int), "ufu");
     upMat(data.materials.shadowOpaque,      matBuf.shadowOpaque,      matBuf.numMaterials * sizeof(int), "sopq");
@@ -149,9 +157,16 @@ void freeGPUModel(GPUModelData& data) {
     cuf(data.materials.uvFlipU);
     cuf(data.materials.shadowOpaque);
     cuf(data.materials.emissionAxis); cuf(data.materials.emissionLobeK); cuf(data.materials.emissionLobeU); cuf(data.materials.emissionGamma);
+    // P0 mipmap chain device arrays
+    cuf(data.materials.mipByteOffsets);
+    cuf(data.materials.mipLevels);
+    cuf(data.materials.mipWidths);
+    cuf(data.materials.mipHeights);
+    cuf(data.materials.mipLevelStart);
     // texObjects is freed separately (needs cudaDestroyTextureObject)
     data.materials.texObjects = nullptr;
     data.materials.texData = nullptr;
+    data.materials.mipData = nullptr;   // freed by freeGPUTextureBuffers
     data.materials.texDataWidths = nullptr;
     data.materials.texDataHeights = nullptr;
     data.materials.numTextures = 0;
